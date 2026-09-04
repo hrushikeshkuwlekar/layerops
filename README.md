@@ -27,11 +27,9 @@
 | Tool | Purpose | Install |
 |---|---|---|
 | [Trivy](https://github.com/aquasecurity/trivy) | Vulnerability scanning | `brew install trivy` |
-| [Copacetic (copa)](https://github.com/project-copacetic/copacetic) | OS package patching | See [copa install](https://project-copacetic.github.io/copacetic/website/installation) |
+| [Copacetic (copa)](https://github.com/project-copacetic/copacetic) | OS package patching (`--patch`) | See [copa install](https://project-copacetic.github.io/copacetic/website/installation) |
 | [jq](https://stedolan.github.io/jq/) | JSON processing | `brew install jq` |
-| Docker / OrbStack | BuildKit for copa | [orbstack.dev](https://orbstack.dev) |
-
-> copa is only required when using `--patch`.
+| Docker (or any BuildKit daemon) | Image pull / push / BuildKit backend for copa | [Docker](https://docs.docker.com/get-docker/) · [OrbStack](https://orbstack.dev) · or run `docker run -d --name buildkitd --privileged moby/buildkit` |
 
 ---
 

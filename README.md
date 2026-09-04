@@ -39,7 +39,7 @@ layerops unifies [Trivy](https://github.com/aquasecurity/trivy) scanning and [Co
 | [Trivy](https://github.com/aquasecurity/trivy) | Vulnerability scanning | `brew install trivy` | `apt install trivy` or see [Trivy install](https://aquasecurity.github.io/trivy/latest/getting-started/installation/) |
 | [Copacetic (copa)](https://github.com/project-copacetic/copacetic) | OS package patching | `brew install copa` or see [copa install](https://project-copacetic.github.io/copacetic/website/installation) | `curl -sSL https://raw.githubusercontent.com/project-copacetic/copacetic/main/scripts/install.sh \| sh` |
 | [jq](https://stedolan.github.io/jq/) | JSON processing | `brew install jq` | `apt install jq` / `yum install jq` |
-| Docker (or any BuildKit daemon) | Image pull / push / BuildKit backend | [Docker Desktop](https://docs.docker.com/get-docker/) | [Docker Engine](https://docs.docker.com/engine/install/) · `docker run -d --name buildkitd --privileged moby/buildkit` |
+| Docker (or any BuildKit daemon)  · docker run -d --name buildkitd --privileged moby/buildkit | Image pull / push / BuildKit backend | [Docker Desktop](https://docs.docker.com/get-docker/) | [Docker Engine](https://docs.docker.com/engine/install/) · `docker run -d --name buildkitd --privileged moby/buildkit` |
 
 ---
 

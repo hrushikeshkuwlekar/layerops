@@ -7,6 +7,9 @@ Assess, patch, and verify OS-package CVEs across public open-source bases, third
 
 [![layerops Sample Report Preview](sample-report-preview.png)](https://hrushikeshkuwlekar.github.io/layerops/sample-report.html)
 
+> [!NOTE]
+> **Why is Total Closed higher than OS-PKG Fixable?** Package updates pull in patched transitive dependencies and distro security errata, resolving additional CVEs that Trivy initially classified as unfixed or had no vendor patch listed.
+
 Container security stalls on images nobody can rebuild: upstream foundation images, vendor-packaged containers, legacy services whose Dockerfile and build pipeline are gone or expensive to trigger. Rebuilding an entire image to update one system package is work out of all proportion to the result.
 
 layerops unifies [Trivy](https://github.com/aquasecurity/trivy) scanning and [Copacetic](https://github.com/project-copacetic/copacetic) in-place patching into one CLI. Across a single image (--image) or a whole inventory (--list), it separates OS packages a machine can patch from language dependencies that need a developer, then writes distro security updates into a new image tag — the original is never modified. A two-pass strategy retries with --ignore-errors when precise patching hits an epoch mismatch or renamed package, so one awkward dependency never costs you the image. Add --verify to re-scan each patched tag and report before → after. Reports export as offline HTML or CSV, with --html | --csv for CI/CD gating and visible reporting.

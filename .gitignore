@@ -1,0 +1,19 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Temporary layerops workdir outputs
+/tmp/layerops-*/
+*.json
+!examples/*.json
+
+# Reports (don't commit generated reports)
+*.html
+*.csv
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo

@@ -1,0 +1,175 @@
+# layerops
+
+**Assess and patch container image vulnerabilities in a single command.**
+
+`layerops` wraps [Trivy](https://github.com/aquasecurity/trivy) for scanning and [Copacetic (copa)](https://github.com/project-copacetic/copacetic) for OS-package patching into one ergonomic CLI. Scan a list of images, get a breakdown of fixable vs unfixed findings by severity and package class, patch distro packages in-place, verify the result, and generate a shareable HTML or CSV report — all in one run.
+
+---
+
+## Features
+
+- **Assess** one image or hundreds via `--image` / `--list`
+- **OS-pkg & lib-pkg** findings reported separately — distro packages vs language packages (jar, npm, pip, go)
+- **Patch** fixable OS packages with copa — writes a new tag, the original image is never modified
+- **Two-pass resilient patching:**
+  - Pass 1 — precise, report-based (`copa -r`) targeting only CVE-confirmed packages
+  - Pass 2 — if pass 1 fails (e.g. epoch version mismatches, Oracle Linux), retries with `copa --ignore-errors` (comprehensive update), pinned to the host's native CPU architecture to avoid QEMU timeouts on multi-arch images
+- **Verify** patched images with a re-scan to confirm findings were actually closed
+- **Distroless / scratch** images correctly labelled instead of `-`
+- **HTML report** — fully offline, searchable, filterable, per-CVE detail with patch results tab and summary tiles (Total Closed, Total Findings Post Patch)
+- **CSV report** — per-image + per-severity + per-CVE rows for downstream tooling
+- **CI gate** — `--fail-on-fixable` exits 1 if any fixable vulnerability is found
+
+---
+
+## Requirements
+
+| Tool | Purpose | Install |
+|---|---|---|
+| [Trivy](https://github.com/aquasecurity/trivy) | Vulnerability scanning | `brew install trivy` |
+| [Copacetic (copa)](https://github.com/project-copacetic/copacetic) | OS package patching | See [copa install](https://project-copacetic.github.io/copacetic/website/installation) |
+| [jq](https://stedolan.github.io/jq/) | JSON processing | `brew install jq` |
+| Docker / OrbStack | BuildKit for copa | [orbstack.dev](https://orbstack.dev) |
+
+> copa is only required when using `--patch`.
+
+---
+
+## Installation
+
+```bash
+# Download and make executable
+curl -fsSL https://raw.githubusercontent.com/hrushikeshkuwlekar/layerops/main/layerops \
+  -o /usr/local/bin/layerops
+chmod +x /usr/local/bin/layerops
+```
+
+Or clone and symlink:
+```bash
+git clone https://github.com/hrushikeshkuwlekar/layerops.git
+ln -s "$PWD/layerops/layerops" /usr/local/bin/layerops
+```
+
+---
+
+## Quick Start
+
+```bash
+# Scan a single image
+layerops --image nginx:1.30.3
+
+# Scan a list of images and generate an HTML report
+layerops --list images.txt --html report.html
+
+# Scan + patch + verify + HTML + CSV report
+layerops --list images.txt --patch --verify --html report.html --csv report.csv
+
+# CI gate — fail if any fixable vuln exists
+layerops --list images.txt --fail-on-fixable
+```
+
+---
+
+## Usage
+
+```
+Usage: layerops --image <repo:tag> [more --image ...] [options]
+       layerops --list <file> [options]
+       layerops --from-json <file> [options]
+
+Input:
+  -i, --image <ref>       Image to scan. Repeat the flag for several images.
+  -l, --list <file>       File of image refs, one per line (# comments allowed).
+  -f, --from-json <file>  Summarise an existing Trivy JSON report, no scanning.
+
+Output:
+  -c, --class <name>      os-pkgs | lib-pkgs | all         (default: all)
+      --csv <file>        Write the full report as CSV
+      --html <file>       Write a standalone HTML report (offline, shareable)
+      --json-dir <dir>    Keep each image's raw Trivy JSON in this directory
+  -o, --save-json <file>  Single-image mode: keep the raw Trivy JSON here
+
+Scan:
+  -p, --pkg-types <list>  Trivy package types              (default: os,library)
+  -s, --severity <list>   Limit severities, e.g. CRITICAL,HIGH
+  -q, --quiet             Suppress Trivy progress output (and copa when patching)
+      --fail-on-fixable   Exit 1 if any fixable vulnerability is found (CI gate)
+
+Patch (Copacetic):
+      --patch             Patch fixable os-pkgs with copa, write a new local tag
+      --patch-suffix <s>  Tag suffix for patched images    (default: lo-delta)
+      --verify            Re-scan each patched image and report before -> after
+      --copa-addr <addr>  BuildKit address, e.g. tcp://0.0.0.0:8888
+      --patch-timeout <d> Per-image copa timeout, both passes (default: 15m)
+  -qc, --copa-quiet       Hide copa BuildKit output (shown on failure)
+  -Qc, --copa-verbose     Show copa output even under --quiet
+
+  -h, --help              This help
+```
+
+---
+
+## How Patching Works
+
+```
++----------------------------------------------------------+
+|  Pass 1: copa patch -i <img> -r <trivy-report> -t <tag>  |
+|  (precise — only CVE-confirmed packages)                  |
++---------------+------------------+------------------------+
+             success            failure
+                |                  |
+                v                  v
+            PATCHED   +---------------------------------+
+                      |  Pass 2: copa patch -i <img>    |
+                      |  -t <tag> --ignore-errors        |
+                      |  --platform <host-native-arch>   |
+                      |  (comprehensive, skips errors)   |
+                      +-------+----------+---------------+
+                           success    failure
+                              |          |
+                              v          v
+                          PATCHED     FAILED
+```
+
+- Pass 2 is pinned to the **host's native CPU architecture** (e.g. `linux/arm64` on Apple Silicon, `linux/amd64` on x86). This avoids extremely slow QEMU emulation timeouts when patching multi-arch images.
+- The patched image is always tagged to the expected ref so `--verify` and the HTML report work correctly.
+
+---
+
+## HTML Report
+
+The generated HTML report is fully self-contained (no CDN, no server) and includes:
+
+- **Summary tiles** — Images scanned, Total findings, Total closed, Findings post patch, OS-pkg fixable/unfixed, Library findings, Distinct CVEs
+- **Overview tab** — Per-image breakdown with OS type, total/fixable/unfixed counts
+- **Distro packages tab** — Every OS CVE, filterable by image, severity, fixability
+- **Libraries tab** — Every lib CVE with package class (jar, npm, go, pip, etc.)
+- **Patch results tab** — Before/after OS counts, PATCHED / FAILED / SKIPPED status per image
+
+---
+
+## images.txt Format
+
+```
+# One image ref per line — # comments are ignored
+quay.io/argoproj/argocd:v3.4.5
+ghcr.io/dexidp/dex:v2.45.1
+docker.io/grafana/grafana:13.1.1
+```
+
+---
+
+## Known Limitations
+
+| Limitation | Detail |
+|---|---|
+| OS packages only | copa cannot patch language packages (jar, npm, pip, go). Those need a dependency bump and app rebuild. |
+| Oracle Linux | copa rejects Oracle Linux base images in report-based mode. The comprehensive retry (pass 2) handles most Oracle images via dnf. |
+| Multi-arch local patching | Patching all platforms locally requires QEMU for non-native arches, which is very slow. Only the host's native arch is patched in pass 2. |
+| EOL distros | Trivy may have incomplete data for end-of-life OS versions (e.g. Ubuntu 20.04). |
+
+---
+
+## License
+
+[Apache License 2.0](LICENSE)

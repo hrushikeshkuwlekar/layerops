@@ -1,0 +1,1725 @@
+#!/usr/bin/env bash
+#
+# layerops
+#
+# Assess and remediate container image layers.
+#
+# ASSESS  — scans one or many images with Trivy and reports total vs fixable
+#           vulnerabilities, split by package class:
+#
+#             os-pkgs    distro packages   (rpm / deb / apk — the base image layer)
+#             lib-pkgs   language packages (jar, npm, pip, go modules — the app layer)
+#
+# REMEDIATE — with --patch, feeds the fixable os-pkgs findings to Copacetic (copa),
+#           which rebuilds the image layer with patched distro packages. The result
+#           is written as a NEW local tag; the original image is never touched.
+#           copa cannot patch lib-pkgs — those need a dependency bump or app rebuild.
+#
+#           Patching uses a two-pass strategy for resilience:
+#             Pass 1 (precise)      — copa with a filtered Trivy report (-r).
+#             Pass 2 (comprehensive) — if pass 1 fails, copa retries without -r,
+#                                      using --ignore-errors to skip individual
+#                                      package failures (e.g. epoch mismatches).
+#                                      Pinned to the host's native CPU architecture
+#                                      to avoid QEMU emulation timeouts on multi-
+#                                      arch images.
+#
+# Assess:        layerops --list images.txt --csv report.csv
+# Assess + fix:  layerops --list images.txt --patch --verify
+#
+
+set -euo pipefail
+
+PROG="${0##*/}"
+VERSION="v4"
+IMAGES=()
+LIST=""
+FROM_JSON=""
+SAVE_JSON=""
+JSON_DIR=""
+CSV_OUT=""
+HTML_OUT=""
+CLASS_FILTER="all"
+PKG_TYPES="os,library"
+SEVERITIES=""
+FAIL_ON_FIXABLE=0
+QUIET=0
+
+PATCH=0
+PATCH_SUFFIX="lo-delta"
+VERIFY=0
+COPA_ADDR=""
+PATCH_TIMEOUT=""
+COPA_QUIET=-1        # -1 = follow --quiet, 0 = show, 1 = hide
+
+usage() {
+  cat <<EOF
+Usage: $PROG --image <repo:tag> [more --image ...] [options]
+       $PROG --list <file> [options]
+       $PROG --from-json <file> [options]
+
+Assess container images for vulnerabilities, and optionally remediate the
+fixable OS-package findings with Copacetic (copa) in the same run.
+
+Input:
+  -i, --image <ref>       Image to scan. Repeat the flag for several images.
+  -l, --list <file>       File of image refs, one per line (# comments allowed).
+  -f, --from-json <file>  Summarise an existing Trivy JSON report, no scanning.
+
+Output:
+  -c, --class <name>      os-pkgs | lib-pkgs | all         (default: all)
+      --csv <file>        Write the full report as CSV (per-image + severity + CVEs)
+      --html <file>       Write a standalone HTML report — every CVE, tabbed by
+                          os-pkgs / lib-pkgs, searchable and filterable. Opens
+                          offline, safe to share as a single file.
+      --json-dir <dir>    Keep each image's raw Trivy JSON in this directory
+  -o, --save-json <file>  Single-image mode: keep the raw Trivy JSON here
+
+Scan:
+  -p, --pkg-types <list>  Trivy package types              (default: os,library)
+  -s, --severity <list>   Limit severities, e.g. CRITICAL,HIGH
+  -q, --quiet             Suppress Trivy's progress output (and copa's, when patching)
+      --fail-on-fixable   Exit 1 if any fixable vulnerability is found (CI gate)
+
+Patch (Copacetic):
+      --patch             Patch fixable os-pkgs findings with copa. Writes a new
+                          local tag; the source image is never modified.
+                          Two-pass strategy is used automatically:
+                            Pass 1 — report-based patch (-r <trivy-report>): precise,
+                                     targets only CVE-confirmed packages.
+                            Pass 2 — if pass 1 fails, retries with copa --ignore-errors
+                                     (comprehensive update, no report). Skips individual
+                                     package failures such as epoch version mismatches.
+                                     Pinned to the host's native CPU arch to avoid
+                                     QEMU timeouts on multi-arch images.
+      --patch-suffix <s>  Tag suffix for patched images       (default: $PATCH_SUFFIX)
+                          nginx:1.30.3 -> nginx:1.30.3-$PATCH_SUFFIX
+      --verify            Re-scan each patched image and report before -> after.
+                          Without it, copa's exit status is taken at face value.
+      --copa-addr <addr>  BuildKit address passed to copa -a, e.g. tcp://0.0.0.0:8888
+      --patch-timeout <d>  Per-image copa timeout for both passes  (default: 15m).
+                          15m is the default because comprehensive updates for large
+                          images can easily exceed copa's built-in 5m limit.
+                          Example: --patch-timeout 30m
+  -qc, --copa-quiet       Hide copa's BuildKit progress and apt chatter. On failure
+                          the captured output is still shown. Implied by --quiet.
+  -Qc, --copa-verbose     Show copa's output even under --quiet.
+
+  -h, --help              This help
+
+Notes:
+  copa patches OS packages only. Language packages (jar, npm, pip, go modules)
+  cannot be patched in place — they need a dependency bump and an app rebuild.
+  In a batch, an image that fails to patch is reported and the run continues.
+
+  OS type detection: images without a recognised distro family (distroless, scratch)
+  are labelled 'distroless' in the report instead of '-'.
+
+  HTML report includes a 'Total closed' tile showing findings removed after patching,
+  updated dynamically when --patch (and optionally --verify) is used.
+
+  Multi-arch images: the comprehensive retry (pass 2) is pinned to the host's native
+  CPU architecture (e.g. linux/arm64 on Apple Silicon, linux/amd64 on x86 machines)
+  to avoid extremely slow QEMU emulation. The patched image is tagged to the expected
+  ref so --verify and the HTML report work correctly.
+
+Examples:
+  $PROG --image quay.io/keycloak/keycloak:26.7.2
+  $PROG --list images.txt --class lib-pkgs --csv lib-report.csv
+  $PROG --list images.txt --patch --verify --csv full-report.csv
+  $PROG --list images.txt --html report.html --csv report.csv
+  $PROG --image nginx:1.30.3 --patch --patch-suffix hotfix
+  $PROG --list images.txt --patch --verify --patch-timeout 30m
+EOF
+}
+
+die()  { printf '%s: %s\n' "$PROG" "$*" >&2; exit 2; }
+warn() { printf '%s: %s\n' "$PROG" "$*" >&2; }
+
+# ---------------------------------------------------------------- arguments --
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -i|--image)      [[ $# -ge 2 ]] || die "$1 needs a value"; IMAGES+=("$2");   shift 2 ;;
+    -l|--list)       [[ $# -ge 2 ]] || die "$1 needs a value"; LIST="$2";        shift 2 ;;
+    -f|--from-json)  [[ $# -ge 2 ]] || die "$1 needs a value"; FROM_JSON="$2";   shift 2 ;;
+    -o|--save-json)  [[ $# -ge 2 ]] || die "$1 needs a value"; SAVE_JSON="$2";   shift 2 ;;
+    --json-dir)      [[ $# -ge 2 ]] || die "$1 needs a value"; JSON_DIR="$2";    shift 2 ;;
+    --csv)           [[ $# -ge 2 ]] || die "$1 needs a value"; CSV_OUT="$2";     shift 2 ;;
+    --html)          [[ $# -ge 2 ]] || die "$1 needs a value"; HTML_OUT="$2";    shift 2 ;;
+    -c|--class)      [[ $# -ge 2 ]] || die "$1 needs a value"; CLASS_FILTER="$2";shift 2 ;;
+    -p|--pkg-types)  [[ $# -ge 2 ]] || die "$1 needs a value"; PKG_TYPES="$2";   shift 2 ;;
+    -s|--severity)   [[ $# -ge 2 ]] || die "$1 needs a value"; SEVERITIES="$2";  shift 2 ;;
+    -q|--quiet)      QUIET=1; shift ;;
+    --fail-on-fixable) FAIL_ON_FIXABLE=1; shift ;;
+    --patch)         PATCH=1; shift ;;
+    --patch-suffix)  [[ $# -ge 2 ]] || die "$1 needs a value"; PATCH_SUFFIX="$2";shift 2 ;;
+    --verify)        VERIFY=1; shift ;;
+    --copa-addr)     [[ $# -ge 2 ]] || die "$1 needs a value"; COPA_ADDR="$2";   shift 2 ;;
+    --patch-timeout)  [[ $# -ge 2 ]] || die "$1 needs a value"; PATCH_TIMEOUT="$2";shift 2 ;;
+    -qc|--copa-quiet)   COPA_QUIET=1; shift ;;
+    -Qc|--copa-verbose) COPA_QUIET=0; shift ;;
+    -h|--help)       usage; exit 0 ;;
+    -*)              die "unknown option: $1 (try --help)" ;;
+    *)               IMAGES+=("$1"); shift ;;
+  esac
+done
+
+case "$CLASS_FILTER" in
+  lib-pkgs|libraries|lang-pkgs) CLASS_FILTER="lang-pkgs" ;;   # accept all, normalise
+  all|os-pkgs) ;;
+  *) die "--class must be os-pkgs, lib-pkgs or all" ;;
+esac
+
+command -v jq >/dev/null 2>&1 || die "jq is required (brew install jq)"
+
+# patch preflight — fail early rather than after a long scan
+if [[ $PATCH -eq 1 ]]; then
+  [[ -n "$FROM_JSON" ]] && die "--patch needs real images; it cannot be used with --from-json"
+  [[ -n "$PATCH_SUFFIX" ]] || die "--patch-suffix cannot be empty"
+  command -v copa >/dev/null 2>&1 \
+    || die "copa is required for --patch — https://project-copacetic.github.io/copacetic/"
+  if ! command -v docker >/dev/null 2>&1 && [[ -z "$COPA_ADDR" ]]; then
+    warn "docker not found and --copa-addr not set; copa needs a BuildKit endpoint"
+  fi
+fi
+[[ $VERIFY -eq 1 && $PATCH -eq 0 ]] && warn "--verify has no effect without --patch"
+
+# copa output follows --quiet unless explicitly overridden
+[[ $COPA_QUIET -eq -1 ]] && COPA_QUIET=$QUIET
+
+# read the image list file
+if [[ -n "$LIST" ]]; then
+  [[ -f "$LIST" ]] || die "no such file: $LIST"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%%#*}"                       # strip comments
+    line="$(printf '%s' "$line" | tr -d '\r' | awk '{$1=$1;print}')"
+    [[ -n "$line" ]] && IMAGES+=("$line")
+  done < "$LIST"
+fi
+
+if [[ ${#IMAGES[@]} -eq 0 && -z "$FROM_JSON" ]]; then usage >&2; exit 2; fi
+
+WORKDIR=""
+cleanup() { [[ -n "$WORKDIR" && -d "$WORKDIR" ]] && rm -rf "$WORKDIR"; return 0; }
+trap cleanup EXIT
+
+# display name for a Trivy class
+display_class() { case "$1" in lang-pkgs) printf 'lib-pkgs';; *) printf '%s' "$1";; esac; }
+
+# -------------------------------------------------------------------- scan ---
+JSONS=()
+LABELS=()
+FAILED=()
+
+if [[ -n "$FROM_JSON" ]]; then
+  [[ -f "$FROM_JSON" ]] || die "no such file: $FROM_JSON"
+  jq -e . "$FROM_JSON" >/dev/null 2>&1 || die "not valid JSON: $FROM_JSON"
+  JSONS+=("$FROM_JSON")
+  LABELS+=("$(basename "$FROM_JSON")")
+else
+  command -v trivy >/dev/null 2>&1 || die "trivy is required (brew install trivy)"
+  WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/layerops.XXXXXX")" || die "could not create temp dir"
+  [[ -n "$JSON_DIR" ]] && mkdir -p "$JSON_DIR"
+
+  total=${#IMAGES[@]}
+  n=0
+  for img in "${IMAGES[@]}"; do
+    n=$((n + 1))
+    if [[ $total -eq 1 && -n "$SAVE_JSON" ]]; then
+      out="$SAVE_JSON"
+    elif [[ -n "$JSON_DIR" ]]; then
+      out="$JSON_DIR/$(printf '%s' "$img" | tr '/:@ ' '____').json"
+    else
+      out="$WORKDIR/$(printf '%s' "$img" | tr '/:@ ' '____').json"
+    fi
+
+    args=(image --pkg-types "$PKG_TYPES" --scanners vuln --format json --output "$out")
+    [[ -n "$SEVERITIES" ]] && args+=(--severity "$SEVERITIES")
+    [[ $QUIET -eq 1 ]] && args+=(--quiet)
+    args+=("$img")
+
+    printf '%s: [%d/%d] scanning %s\n' "$PROG" "$n" "$total" "$img" >&2
+    if trivy "${args[@]}" && jq -e . "$out" >/dev/null 2>&1; then
+      JSONS+=("$out")
+      LABELS+=("$img")
+    else
+      warn "SKIPPED (scan failed): $img"
+      FAILED+=("$img")
+    fi
+  done
+  echo >&2
+
+  [[ ${#JSONS[@]} -eq 0 ]] && die "no image could be scanned"
+fi
+
+# ------------------------------------------------------------------ render ---
+pretty() { if command -v column >/dev/null 2>&1; then column -t -s $'\t'; else cat; fi; }
+
+# classes present across all reports, os-pkgs / lang-pkgs first
+found="$(jq -rn '[ inputs | .Results[]? | select((( .Vulnerabilities // []) | length) > 0)
+                  | .Class // "unknown" ] | unique[]' "${JSONS[@]}")"
+
+CLASSES=()
+if [[ "$CLASS_FILTER" != "all" ]]; then
+  CLASSES=("$CLASS_FILTER")
+else
+  for want in os-pkgs lang-pkgs; do
+    grep -qx -- "$want" <<<"$found" && CLASSES+=("$want")
+  done
+  while IFS= read -r c; do
+    [[ -n "$c" ]] || continue
+    case "$c" in os-pkgs|lang-pkgs) ;; *) CLASSES+=("$c") ;; esac
+  done <<<"$found"
+fi
+
+if [[ ${#CLASSES[@]} -eq 0 ]]; then
+  echo "No vulnerabilities found."
+  exit 0
+fi
+
+# severity table for one class across the given report files
+severity_table() {
+  local class="$1"; shift
+  jq -rn --arg c "$class" '
+    def rank: {"CRITICAL":0,"HIGH":1,"MEDIUM":2,"LOW":3,"UNKNOWN":4}[.] // 5;
+    def fixable: [.[] | select((.FixedVersion // "") != "")] | length;
+    def unfixed: [.[] | select((.FixedVersion // "") == "")] | length;
+    [ inputs | .Results[]? | select((.Class // "unknown") == $c) | (.Vulnerabilities // [])[] ] as $v
+    | (["SEVERITY","TOTAL","FIXABLE","UNFIXED"] | @tsv),
+      ( $v | group_by(.Severity) | sort_by(.[0].Severity | rank)[]
+           | [ .[0].Severity, length, fixable, unfixed ] | @tsv ),
+      ( ["TOTAL", ($v|length), ($v|fixable), ($v|unfixed)] | @tsv )
+  ' "$@"
+}
+
+# one row of counts for one class in one report file
+counts_row() {
+  jq -r --arg c "$1" '
+    [ .Results[]? | select((.Class // "unknown") == $c) | (.Vulnerabilities // [])[] ] as $v
+    | [ ($v|length),
+        ([$v[] | select((.FixedVersion // "") != "")] | length),
+        ([$v[] | select((.FixedVersion // "") == "")] | length) ] | @tsv
+  ' "$2"
+}
+
+# the "type" of an image for a class:
+#   os-pkgs   -> the detected distro, e.g. "debian 12.5", "redhat 9.8", "alpine 3.19"
+#   lang-pkgs -> the language package types present, e.g. "jar", "jar,gobinary"
+type_for() {
+  local class="$1" file="$2"
+  if [[ "$class" == "os-pkgs" ]]; then
+    jq -r '
+      (.Metadata.OS.Family // "") as $f | (.Metadata.OS.Name // "") as $n
+      | if $f == "" then "distroless"
+        else $f + (if $n == "" then "" else " " + $n end) end' "$file"
+  else
+    jq -r --arg c "$class" '
+      [ .Results[]? | select((.Class // "unknown") == $c) | .Type // empty ]
+      | unique | join(",") | if . == "" then "-" else . end' "$file"
+  fi
+}
+
+MULTI=0
+[[ ${#JSONS[@]} -gt 1 ]] && MULTI=1
+
+# single-image mode: identify the image up front
+if [[ $MULTI -eq 0 ]]; then
+  {
+    printf 'IMAGE:\t%s\n' "${LABELS[0]}"
+    printf 'OS:\t%s\n'    "$(type_for os-pkgs "${JSONS[0]}")"
+    printf 'LIB-PKGS:\t%s\n'  "$(type_for lang-pkgs "${JSONS[0]}")"
+  } | pretty
+  echo
+fi
+
+for class in "${CLASSES[@]}"; do
+  if [[ $MULTI -eq 1 ]]; then
+    echo "=== $(display_class "$class") — per image ==="
+    {
+      printf 'IMAGE\tTYPE\tTOTAL\tFIXABLE\tUNFIXED\n'
+      for i in "${!JSONS[@]}"; do
+        printf '%s\t%s\t%s\n' "${LABELS[$i]}" \
+          "$(type_for "$class" "${JSONS[$i]}")" \
+          "$(counts_row "$class" "${JSONS[$i]}")"
+      done
+    } | pretty
+    echo
+    echo "=== $(display_class "$class") — master total (${#JSONS[@]} images) ==="
+  else
+    echo "=== $(display_class "$class") ($(type_for "$class" "${JSONS[0]}")) ==="
+  fi
+
+  severity_table "$class" "${JSONS[@]}" | pretty
+  echo
+
+  if [[ $MULTI -eq 1 ]]; then
+    jq -rn --arg c "$class" '
+      [ inputs | .Results[]? | select((.Class // "unknown") == $c) | (.Vulnerabilities // [])[] ] as $v
+      | "distinct CVEs: \($v | map(.VulnerabilityID) | unique | length)   " +
+        "distinct fixable: \($v | map(select((.FixedVersion // "") != "") | .VulnerabilityID) | unique | length)   " +
+        "distinct unfixed: \($v | map(select((.FixedVersion // "") == "") | .VulnerabilityID) | unique | length)"
+    ' "${JSONS[@]}"
+    echo
+  fi
+done
+
+# ------------------------------------------------------------------- patch ---
+# copa consumes a Trivy report and patches only OS packages that carry a fixed
+# version. Rather than re-scanning, derive that report from the JSON we already
+# have: keep os-pkgs results, drop findings with no FixedVersion.
+copa_report() {
+  jq '
+    .Results = [ .Results[]?
+      | select((.Class // "") == "os-pkgs")
+      | .Vulnerabilities = [ (.Vulnerabilities // [])[]
+                             | select((.FixedVersion // "") != "") ]
+      | select((.Vulnerabilities | length) > 0) ]
+  ' "$1" > "$2"
+}
+
+# nginx:1.30.3 -> 1.30.3-lo-delta   (copa -t takes the tag, not the full ref)
+# quay.io/x/y  -> latest-lo-delta   (untagged refs resolve to :latest)
+patched_tag() {
+  local ref="${1%@*}" tag                    # drop any @sha256:... digest
+  if [[ "${ref##*/}" == *:* ]]; then tag="${ref##*:}"; else tag="latest"; fi
+  printf '%s-%s' "$tag" "$PATCH_SUFFIX"
+}
+patched_ref() {
+  local ref="${1%@*}" repo
+  if [[ "${ref##*/}" == *:* ]]; then repo="${ref%:*}"; else repo="$ref"; fi
+  printf '%s:%s' "$repo" "$(patched_tag "$1")"
+}
+
+PATCH_ROWS=()
+PATCH_OK=0; PATCH_FAIL=0; PATCH_SKIP=0
+PATCH_FAILED_IMGS=()
+
+if [[ $PATCH -eq 1 ]]; then
+  echo "=== patch — copa (os-pkgs only) ==="
+
+  ptotal=${#JSONS[@]}
+  pn=0
+  for i in "${!JSONS[@]}"; do
+    pn=$((pn + 1))
+    img="${LABELS[$i]}"
+    src="${JSONS[$i]}"
+
+    IFS=$'\t' read -r os_total os_fix _os_unfix <<<"$(counts_row os-pkgs "$src")"
+
+    # nothing copa can act on — scratch/distroless images land here too
+    if [[ "${os_fix:-0}" -eq 0 ]]; then
+      PATCH_SKIP=$((PATCH_SKIP + 1))
+      PATCH_ROWS+=("$(printf '%s\t-\t%s\t%s\tSKIPPED\t-\t-' "$img" "$os_total" "$os_fix")")
+      printf '%s: [%d/%d] skipping %s (no fixable os-pkgs)\n' "$PROG" "$pn" "$ptotal" "$img" >&2
+      continue
+    fi
+
+    newref="$(patched_ref "$img")"
+    rep="$WORKDIR/copa-$(printf '%s' "$img" | tr '/:@ ' '____').json"
+    copa_report "$src" "$rep"
+
+    cargs=(patch -i "$img" -r "$rep" -t "$(patched_tag "$img")")
+    [[ -n "$COPA_ADDR" ]] && cargs+=(-a "$COPA_ADDR")
+    cargs+=(--timeout "${PATCH_TIMEOUT:-15m}")
+
+    printf '%s: [%d/%d] patching %s -> %s\n' "$PROG" "$pn" "$ptotal" "$img" "$newref" >&2
+
+    # copa is loud: BuildKit progress bars plus every apt line. When quiet, capture
+    # it and replay only on failure — silence when it works, diagnostics when it doesn't.
+    clog="$WORKDIR/copa-log-$pn.txt"
+    if [[ $COPA_QUIET -eq 1 ]]; then
+      copa_run() { copa "$@" >"$clog" 2>&1; }
+    else
+      copa_run() { copa "$@" >&2; }
+    fi
+
+    # an image that fails to patch must not take the batch down with it
+    # Strategy: first try with the Trivy report (-r), which is precise.
+    # If that fails (e.g. version-comparison issues like libreoffice epoch
+    # mismatches), retry without -r but with --ignore-errors — copa then
+    # does a comprehensive update, skipping individual package failures.
+    copa_ok=0
+    if copa_run "${cargs[@]}"; then
+      # If docker daemon normalized the name (e.g. stripped docker.io/library/), alias to $newref
+      if ! docker image inspect "$newref" >/dev/null 2>&1; then
+        for cand in "${newref#docker.io/library/}" "${newref#docker.io/}"; do
+          if docker image inspect "$cand" >/dev/null 2>&1; then
+            docker tag "$cand" "$newref" >/dev/null 2>&1
+            break
+          fi
+        done
+      fi
+      copa_ok=1
+    else
+      warn "report-based patch failed for $img — retrying with --ignore-errors (no report)"
+      if [[ $COPA_QUIET -eq 1 && -s "$clog" ]]; then
+        printf '  --- copa output (last 15 lines) ---\n' >&2
+        tail -n 15 "$clog" | sed 's/^/  /' >&2
+        printf '  -----------------------------------\n' >&2
+      fi
+
+      # build retry args: same flags minus -r, plus --ignore-errors
+      # comprehensive updates are heavier — use a longer timeout (15m)
+      # unless the user explicitly set --patch-timeout.
+      # Pin to the host's native platform so multi-arch images don't
+      # waste time on QEMU-emulated foreign architectures.
+      host_arch=""
+      case "$(uname -m)" in
+        x86_64|amd64)  host_arch="linux/amd64" ;;
+        arm64|aarch64) host_arch="linux/arm64" ;;
+        armv7*)        host_arch="linux/arm/v7" ;;
+        *)             host_arch="" ;;   # let copa decide
+      esac
+      rargs=(patch -i "$img" -t "$(patched_tag "$img")" --ignore-errors)
+      [[ -n "$COPA_ADDR" ]] && rargs+=(-a "$COPA_ADDR")
+      [[ -n "$host_arch" ]] && rargs+=(--platform "$host_arch")
+      rargs+=(--timeout "${PATCH_TIMEOUT:-15m}")
+
+      printf '%s: [%d/%d] retrying %s (comprehensive + --ignore-errors)\n' \
+        "$PROG" "$pn" "$ptotal" "$img" >&2
+
+      if copa_run "${rargs[@]}"; then
+        # Copa with --platform appends an arch suffix (e.g. -arm64), and Docker
+        # daemon normalizes Docker Hub library images (stripping docker.io/library/).
+        # Check all candidate tags in Docker daemon and alias to $newref.
+        arch_suffix=""
+        case "$host_arch" in
+          linux/amd64)  arch_suffix="-amd64" ;;
+          linux/arm64)  arch_suffix="-arm64" ;;
+          linux/arm/v7) arch_suffix="-armv7" ;;
+        esac
+        found_img=""
+        candidates=(
+          "$newref"
+          "${newref}${arch_suffix}"
+          "${newref#docker.io/library/}"
+          "${newref#docker.io/library/}${arch_suffix}"
+          "${newref#docker.io/}"
+          "${newref#docker.io/}${arch_suffix}"
+        )
+        for cand in "${candidates[@]}"; do
+          if [[ -n "$cand" ]] && docker image inspect "$cand" >/dev/null 2>&1; then
+            found_img="$cand"
+            break
+          fi
+        done
+        if [[ -n "$found_img" ]]; then
+          if [[ "$found_img" != "$newref" ]]; then
+            docker tag "$found_img" "$newref" >/dev/null 2>&1
+          fi
+          copa_ok=1
+        else
+          warn "retry exited 0 but patched image not found in docker: $newref"
+        fi
+      fi
+    fi
+
+    if [[ $copa_ok -eq 1 ]]; then
+      PATCH_OK=$((PATCH_OK + 1))
+      after_total="-"; after_fix="-"; removed="-"
+
+      if [[ $VERIFY -eq 1 ]]; then
+        vout="$WORKDIR/verify-$(printf '%s' "$newref" | tr '/:@ ' '____').json"
+        vargs=(image --pkg-types os --scanners vuln --format json --output "$vout")
+        [[ -n "$SEVERITIES" ]] && vargs+=(--severity "$SEVERITIES")
+        [[ $QUIET -eq 1 ]] && vargs+=(--quiet)
+        vargs+=("$newref")
+
+        printf '%s: [%d/%d] verifying %s\n' "$PROG" "$pn" "$ptotal" "$newref" >&2
+        if trivy "${vargs[@]}" && jq -e . "$vout" >/dev/null 2>&1; then
+          IFS=$'\t' read -r after_total after_fix _av <<<"$(counts_row os-pkgs "$vout")"
+          removed=$(( os_total - after_total ))
+        else
+          warn "patched but could not verify: $newref"
+          after_total="ERR"; after_fix="ERR"; removed="-"
+        fi
+      fi
+
+      PATCH_ROWS+=("$(printf '%s\t%s\t%s\t%s\tPATCHED\t%s\t%s' \
+        "$img" "$newref" "$os_total" "$os_fix" "$after_total" "$removed")")
+    else
+      PATCH_FAIL=$((PATCH_FAIL + 1))
+      PATCH_FAILED_IMGS+=("$img")
+      warn "PATCH FAILED (continuing): $img"
+      # a suppressed failure is a silent failure — always show why
+      if [[ $COPA_QUIET -eq 1 && -s "$clog" ]]; then
+        printf '  --- copa output (last 15 lines) ---\n' >&2
+        tail -n 15 "$clog" | sed 's/^/  /' >&2
+        printf '  -----------------------------------\n' >&2
+      fi
+      PATCH_ROWS+=("$(printf '%s\t-\t%s\t%s\tFAILED\t-\t-' "$img" "$os_total" "$os_fix")")
+    fi
+  done
+  echo >&2
+
+  {
+    printf 'IMAGE\tPATCHED TAG\tOS BEFORE\tFIXABLE\tSTATUS\tOS AFTER\tREMOVED\n'
+    printf '%s\n' "${PATCH_ROWS[@]}"
+  } | pretty
+  echo
+
+  printf 'patched: %d   failed: %d   skipped (nothing fixable): %d\n' \
+    "$PATCH_OK" "$PATCH_FAIL" "$PATCH_SKIP"
+  if [[ $VERIFY -eq 1 ]]; then
+    closed_sum=0
+    for row in "${PATCH_ROWS[@]}"; do
+      rem="$(printf '%s' "$row" | cut -f7)"
+      [[ "$rem" =~ ^[0-9]+$ ]] && closed_sum=$(( closed_sum + rem ))
+    done
+    printf 'closed: %d findings removed across %d patched image(s) (verified)\n' \
+      "$closed_sum" "$PATCH_OK"
+  else
+    closed_sum=0
+    for row in "${PATCH_ROWS[@]}"; do
+      st="$(printf '%s' "$row" | cut -f5)"
+      if [[ "$st" == "PATCHED" ]]; then
+        fix="$(printf '%s' "$row" | cut -f4)"
+        [[ "$fix" =~ ^[0-9]+$ ]] && closed_sum=$(( closed_sum + fix ))
+      fi
+    done
+    printf 'closed: %d fixable findings patched across %d image(s) (unverified)\n' \
+      "$closed_sum" "$PATCH_OK"
+    echo "(copa exit status taken at face value — add --verify to re-scan)"
+  fi
+  echo
+fi
+
+# --------------------------------------------------------------------- csv ---
+if [[ -n "$CSV_OUT" ]]; then
+  {
+    # --- Section 1: per-image breakdown ---
+    echo "## Per-Image Breakdown"
+    printf '%s\n' "image,os_type,os_total,os_fixable,os_unfixed,lib_type,lib_total,lib_fixable,lib_unfixed,grand_total,grand_fixable,grand_unfixed"
+    for i in "${!JSONS[@]}"; do
+      os_type="$(type_for os-pkgs "${JSONS[$i]}")"
+      os_counts="$(counts_row os-pkgs "${JSONS[$i]}")"
+      lib_type="$(type_for lang-pkgs "${JSONS[$i]}")"
+      lib_counts="$(counts_row lang-pkgs "${JSONS[$i]}")"
+
+      IFS=$'\t' read -r ot of ou <<<"$os_counts"
+      IFS=$'\t' read -r lt lf lu <<<"$lib_counts"
+      gt=$(( ot + lt )); gf=$(( of + lf )); gu=$(( ou + lu ))
+
+      printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+        "${LABELS[$i]}" "$os_type" "$ot" "$of" "$ou" \
+        "$lib_type" "$lt" "$lf" "$lu" "$gt" "$gf" "$gu"
+    done
+    echo
+
+    # --- Section 2: severity totals per class ---
+    for class in "${CLASSES[@]}"; do
+      echo "## $(display_class "$class") — severity totals (${#JSONS[@]} images)"
+      echo "severity,total,fixable,unfixed"
+      jq -rn --arg c "$class" '
+        def rank: {"CRITICAL":0,"HIGH":1,"MEDIUM":2,"LOW":3,"UNKNOWN":4}[.] // 5;
+        def fixable: [.[] | select((.FixedVersion // "") != "")] | length;
+        def unfixed: [.[] | select((.FixedVersion // "") == "")] | length;
+        [ inputs | .Results[]? | select((.Class // "unknown") == $c)
+          | (.Vulnerabilities // [])[] ] as $v
+        | ( $v | group_by(.Severity) | sort_by(.[0].Severity | rank)[]
+             | [ .[0].Severity, length, fixable, unfixed ] | @csv ),
+          ( ["TOTAL", ($v|length), ($v|fixable), ($v|unfixed)] | @csv )
+      ' "${JSONS[@]}"
+      echo
+    done
+
+    # --- Section 3: distinct CVE counts per class ---
+    if [[ $MULTI -eq 1 ]]; then
+      echo "## Distinct CVE Counts"
+      echo "class,distinct_cves,distinct_fixable,distinct_unfixed"
+      for class in "${CLASSES[@]}"; do
+        jq -rn --arg c "$class" --arg cn "$(display_class "$class")" '
+          [ inputs | .Results[]? | select((.Class // "unknown") == $c)
+            | (.Vulnerabilities // [])[] ] as $v
+          | [ $cn,
+              ($v | map(.VulnerabilityID) | unique | length),
+              ($v | map(select((.FixedVersion // "") != "") | .VulnerabilityID) | unique | length),
+              ($v | map(select((.FixedVersion // "") == "") | .VulnerabilityID) | unique | length)
+            ] | @csv
+        ' "${JSONS[@]}"
+      done
+      echo
+    fi
+
+    # --- Section 4: patch results ---
+    if [[ $PATCH -eq 1 ]]; then
+      echo "## Patch Results (copa, os-pkgs only)"
+      echo "image,patched_tag,os_before,os_fixable,status,os_after,removed"
+      for row in "${PATCH_ROWS[@]}"; do
+        printf '%s\n' "$row" | tr '\t' ','
+      done
+    fi
+  } > "$CSV_OUT"
+  printf '%s: wrote %s\n' "$PROG" "$CSV_OUT" >&2
+fi
+
+# -------------------------------------------------------------------- html ---
+# A standalone report: every finding, tabbed by class, filterable, shareable.
+# Data is normalised (image + severity as indices, titles deduped by CVE) so a
+# large estate stays a file you can email rather than a multi-megabyte dump.
+write_html() {
+  local out="$1" i ot of ou lt lf lu failed_json='[]' patch_json='[]'
+
+  if [[ ${#FAILED[@]} -gt 0 ]]; then
+    failed_json="$(printf '%s\n' "${FAILED[@]}" | jq -Rsc 'split("\n")|map(select(length>0))')"
+  fi
+  if [[ ${#PATCH_ROWS[@]} -gt 0 ]]; then
+    patch_json="$(printf '%s\n' "${PATCH_ROWS[@]}" \
+                  | jq -Rsc 'split("\n")|map(select(length>0)|split("\t"))')"
+  fi
+
+  {
+    cat <<'LAYEROPS_HTML_HEAD'
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>layerops report</title>
+<style>
+:root{
+  --ground:#F6F8F8; --surface:#FFFFFF; --surface-2:#EDF2F2; --surface-3:#E3EBEA;
+  --ink:#141E1D; --ink-2:#3A4948; --muted:#62726F;
+  --line:#DBE3E2; --line-strong:#C2CFCD;
+  --accent:#0E6C76; --accent-ink:#0A5058; --accent-soft:#E0F0F1;
+  --crit:#93142B; --crit-bg:#FBE7EA;
+  --high:#B24310; --high-bg:#FBEDE4;
+  --med:#8A6109;  --med-bg:#FBF3DF;
+  --low:#4A6470;  --low-bg:#E9EFF2;
+  --unk:#62726F;  --unk-bg:#ECEFEF;
+  --ok:#14654E;   --ok-bg:#DCEFE7;
+  --f-sans:system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  --f-mono:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
+  --radius:4px;
+}
+@media (prefers-color-scheme:dark){
+  :root:not([data-theme="light"]){
+    --ground:#0D1413; --surface:#141E1D; --surface-2:#1B2726; --surface-3:#233130;
+    --ink:#E7EEED; --ink-2:#C3D0CE; --muted:#8CA09D;
+    --line:#24322F; --line-strong:#3B4C49;
+    --accent:#57C4CE; --accent-ink:#8FDCE3; --accent-soft:#10312F;
+    --crit:#F1798C; --crit-bg:#351018;
+    --high:#F0996A; --high-bg:#33200F;
+    --med:#DEB763;  --med-bg:#2E2510;
+    --low:#9FB6C1;  --low-bg:#1A2529;
+    --unk:#8CA09D;  --unk-bg:#1E2726;
+    --ok:#63C9A4;   --ok-bg:#0F2E26;
+  }
+}
+:root[data-theme="dark"]{
+  --ground:#0D1413; --surface:#141E1D; --surface-2:#1B2726; --surface-3:#233130;
+  --ink:#E7EEED; --ink-2:#C3D0CE; --muted:#8CA09D;
+  --line:#24322F; --line-strong:#3B4C49;
+  --accent:#57C4CE; --accent-ink:#8FDCE3; --accent-soft:#10312F;
+  --crit:#F1798C; --crit-bg:#351018;
+  --high:#F0996A; --high-bg:#33200F;
+  --med:#DEB763;  --med-bg:#2E2510;
+  --low:#9FB6C1;  --low-bg:#1A2529;
+  --unk:#8CA09D;  --unk-bg:#1E2726;
+  --ok:#63C9A4;   --ok-bg:#0F2E26;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--ground);color:var(--ink);font-family:var(--f-sans);font-size:14px;line-height:1.5;-webkit-font-smoothing:antialiased}
+.page{max-width:1500px;margin:0 auto;padding:26px 26px 90px}
+
+/* ---------------------------------------------------------------- header -- */
+header.top{border-bottom:2px solid var(--ink);padding-bottom:16px;margin-bottom:22px}
+.top-row{display:flex;justify-content:space-between;align-items:baseline;gap:16px;flex-wrap:wrap;
+  font-family:var(--f-mono);font-size:11px;letter-spacing:.09em;text-transform:uppercase;color:var(--muted);margin-bottom:10px}
+h1{font-family:var(--f-mono);font-size:28px;font-weight:600;letter-spacing:-.02em;margin:0 0 6px}
+.sub{color:var(--ink-2);margin:0;font-size:15px}
+
+/* ----------------------------------------------------------------- tiles -- */
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(176px,1fr));gap:12px;margin:22px 0}
+.tile{background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);padding:13px 15px}
+.tile .lab{font-size:10.5px;letter-spacing:.09em;text-transform:uppercase;color:var(--muted);margin-bottom:5px}
+.tile .val{font-family:var(--f-mono);font-size:26px;font-weight:600;line-height:1.1;color:var(--ink)}
+.tile .foot{font-size:12px;color:var(--muted);margin-top:3px}
+.tile.crit .val{color:var(--crit)} .tile.ok .val{color:var(--ok)} .tile.acc .val{color:var(--accent-ink)}
+.tile.warn .val{color:var(--med)}
+.tile.act{cursor:pointer;text-align:left;width:100%;font:inherit}
+.tile.act:hover{border-color:var(--accent);background:var(--accent-soft)}
+.tile .go{display:block;margin-top:7px;font-size:10.5px;letter-spacing:.06em;text-transform:uppercase;color:var(--accent-ink);font-weight:600}
+
+/* ------------------------------------------------------------------ tabs -- */
+.tabs{display:flex;gap:2px;border-bottom:1px solid var(--line-strong);margin:26px 0 0;flex-wrap:wrap}
+.tab{appearance:none;background:none;border:none;border-bottom:2px solid transparent;
+  font-family:var(--f-sans);font-size:13px;font-weight:600;color:var(--muted);
+  padding:9px 15px;cursor:pointer;border-radius:var(--radius) var(--radius) 0 0;white-space:nowrap}
+.tab:hover{color:var(--ink);background:var(--surface-2)}
+.tab[aria-selected="true"]{color:var(--accent-ink);border-bottom-color:var(--accent);background:var(--surface)}
+.tab .n{font-family:var(--f-mono);font-size:11px;font-weight:500;color:var(--muted);margin-left:7px}
+.tab[aria-selected="true"] .n{color:var(--accent)}
+.tab:focus-visible,button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.panel{display:none;padding-top:22px}
+.panel.on{display:block}
+
+/* --------------------------------------------------------------- filters -- */
+.filters{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:14px}
+.search{flex:1;min-width:220px;max-width:420px;position:relative}
+.search input{width:100%;font-family:var(--f-sans);font-size:13px;padding:7px 11px;
+  background:var(--surface);color:var(--ink);border:1px solid var(--line-strong);border-radius:var(--radius)}
+.chips{display:flex;gap:4px;flex-wrap:wrap}
+.chip{appearance:none;font-family:var(--f-sans);font-size:11px;font-weight:600;letter-spacing:.03em;
+  padding:5px 10px;border-radius:20px;cursor:pointer;background:var(--surface);
+  border:1px solid var(--line-strong);color:var(--muted)}
+.chip[aria-pressed="true"]{color:#fff;border-color:transparent}
+.chip[data-sev="0"][aria-pressed="true"]{background:var(--crit)}
+.chip[data-sev="1"][aria-pressed="true"]{background:var(--high)}
+.chip[data-sev="2"][aria-pressed="true"]{background:var(--med)}
+.chip[data-sev="3"][aria-pressed="true"]{background:var(--low)}
+.chip[data-sev="4"][aria-pressed="true"]{background:var(--unk)}
+.chip.fx[aria-pressed="true"]{background:var(--accent);color:#fff}
+select.sel{font-family:var(--f-sans);font-size:12.5px;padding:6px 9px;background:var(--surface);
+  color:var(--ink);border:1px solid var(--line-strong);border-radius:var(--radius);max-width:230px}
+.btn{appearance:none;font-family:var(--f-sans);font-size:12px;font-weight:600;padding:6px 12px;
+  background:var(--surface);color:var(--ink-2);border:1px solid var(--line-strong);
+  border-radius:var(--radius);cursor:pointer}
+.btn:hover{background:var(--surface-2);color:var(--ink)}
+.btn.pri{background:var(--accent);border-color:var(--accent);color:#fff}
+.btn.pri:hover{background:var(--accent-ink)}
+.spacer{flex:1}
+
+/* ------------------------------------------------------------ sev ribbon -- */
+.ribbon{display:flex;height:8px;border-radius:2px;overflow:hidden;gap:2px;margin:4px 0 16px;background:transparent}
+.ribbon span{display:block}
+.rlegend{display:flex;gap:14px;flex-wrap:wrap;font-size:11.5px;color:var(--muted);margin-bottom:18px}
+.rlegend i{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:5px;vertical-align:baseline}
+
+/* ---------------------------------------------------------------- tables -- */
+.tw{overflow-x:auto;border:1px solid var(--line);border-radius:var(--radius);background:var(--surface)}
+table{border-collapse:collapse;width:100%;font-size:13px}
+th{font-size:10px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;text-align:left;
+  color:var(--muted);background:var(--surface-2);padding:9px 11px;
+  border-bottom:1px solid var(--line-strong);white-space:nowrap;position:sticky;top:0;z-index:1}
+th.s{cursor:pointer;user-select:none}
+th.s:hover{color:var(--ink)}
+th .ar{opacity:.45;margin-left:4px;font-size:9px}
+td{padding:8px 11px;border-bottom:1px solid var(--line);vertical-align:top;color:var(--ink-2)}
+tbody tr:last-child td{border-bottom:none}
+tbody tr:hover{background:var(--surface-2)}
+td.m{font-family:var(--f-mono);font-size:12px;color:var(--ink);white-space:nowrap}
+td.num{font-family:var(--f-mono);font-size:12px;text-align:right;font-variant-numeric:tabular-nums}
+td.ttl{white-space:normal;min-width:220px;color:var(--muted);font-size:12.5px}
+a.cve{font-family:var(--f-mono);font-size:12px;color:var(--accent-ink);text-decoration:none;font-weight:600;white-space:nowrap}
+a.cve:hover{text-decoration:underline}
+.sev{display:inline-block;font-size:10px;font-weight:700;letter-spacing:.05em;
+  padding:2px 7px;border-radius:3px;white-space:nowrap}
+.sev0{color:var(--crit);background:var(--crit-bg)}
+.sev1{color:var(--high);background:var(--high-bg)}
+.sev2{color:var(--med);background:var(--med-bg)}
+.sev3{color:var(--low);background:var(--low-bg)}
+.sev4{color:var(--unk);background:var(--unk-bg)}
+.fixv{font-family:var(--f-mono);font-size:12px;color:var(--ok);white-space:nowrap}
+.nofix{font-size:11px;color:var(--muted);font-style:italic}
+.imgs{font-family:var(--f-mono);font-size:11.5px;color:var(--muted)}
+details.imgd summary{cursor:pointer;font-family:var(--f-mono);font-size:11.5px;color:var(--accent-ink);white-space:nowrap}
+details.imgd ul{margin:6px 0 0;padding-left:16px;font-family:var(--f-mono);font-size:11px;color:var(--muted);max-width:420px}
+details.imgd li{margin:2px 0;word-break:break-all;white-space:normal}
+.status{display:inline-block;font-size:10px;font-weight:700;letter-spacing:.05em;padding:2px 7px;border-radius:3px}
+.st-PATCHED{color:var(--ok);background:var(--ok-bg)}
+.st-FAILED{color:var(--crit);background:var(--crit-bg)}
+.st-SKIPPED{color:var(--med);background:var(--med-bg)}
+
+/* ------------------------------------------------------------- paginator -- */
+.pager{display:flex;align-items:center;gap:10px;margin-top:14px;flex-wrap:wrap}
+.pager .info{font-size:12px;color:var(--muted);font-variant-numeric:tabular-nums}
+.empty{padding:40px 20px;text-align:center;color:var(--muted);font-size:14px}
+
+/* ---------------------------------------------------------------- notice -- */
+.note{border-left:3px solid var(--accent);background:var(--accent-soft);padding:11px 14px;
+  border-radius:0 var(--radius) var(--radius) 0;margin:16px 0;max-width:74ch;font-size:13px;color:var(--ink-2)}
+.note b{color:var(--accent-ink)}
+.note.warn{border-left-color:var(--crit);background:var(--crit-bg)}
+.note.warn b{color:var(--crit)}
+h2{font-size:12px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--ink);
+  margin:28px 0 10px;padding-bottom:7px;border-bottom:1px solid var(--line-strong)}
+footer{margin-top:44px;padding-top:16px;border-top:1px solid var(--line);font-size:12px;color:var(--muted)}
+.toast{position:fixed;bottom:22px;left:50%;transform:translateX(-50%);background:var(--ink);color:var(--ground);
+  font-size:13px;padding:9px 18px;border-radius:20px;opacity:0;pointer-events:none;transition:opacity .18s}
+.toast.on{opacity:1}
+@media (prefers-reduced-motion:reduce){*{transition:none!important}}
+@media print{
+  body{background:#fff}
+  .filters,.pager,.tabs,.toast{display:none!important}
+  .panel{display:block!important;page-break-before:always}
+  .tw{overflow:visible;border:none}
+  th{position:static}
+}
+</style>
+</head>
+<body>
+<div class="page">
+
+<header class="top">
+  <div class="top-row">
+    <span id="m-tool">layerops</span>
+    <span id="m-when"></span>
+  </div>
+  <h1>Container Vulnerability Report</h1>
+  <p class="sub" id="m-sub"></p>
+</header>
+
+<div class="tiles" id="tiles"></div>
+
+<div class="tabs" role="tablist" id="tabs"></div>
+
+<!-- overview -->
+<section class="panel" id="p-ov" role="tabpanel">
+  <h2>Severity distribution</h2>
+  <div id="ov-ribbons"></div>
+  <h2>Per-image breakdown</h2>
+  <div class="filters">
+    <div class="search"><input id="ov-q" type="search" placeholder="Filter images…" aria-label="Filter images"></div>
+    <div class="spacer"></div>
+    <button class="btn" id="ov-csv">Copy as CSV</button>
+  </div>
+  <div class="tw"><table id="ov-t">
+    <thead><tr>
+      <th class="s" data-k="img">Image<span class="ar"></span></th>
+      <th class="s" data-k="ostype">Base OS<span class="ar"></span></th>
+      <th class="s" data-k="ot" style="text-align:right">OS-pkg total<span class="ar"></span></th>
+      <th class="s" data-k="of" style="text-align:right">OS-pkg fixable<span class="ar"></span></th>
+      <th class="s" data-k="libtype">Lib type<span class="ar"></span></th>
+      <th class="s" data-k="lt" style="text-align:right">Lib total<span class="ar"></span></th>
+      <th class="s" data-k="lf" style="text-align:right">Lib fixable<span class="ar"></span></th>
+      <th class="s" data-k="gt" style="text-align:right">Total<span class="ar"></span></th>
+    </tr></thead><tbody></tbody>
+  </table></div>
+  <div id="ov-empty"></div>
+</section>
+
+<!-- os + lib share one markup shape -->
+<section class="panel" id="p-os" role="tabpanel"></section>
+<section class="panel" id="p-lib" role="tabpanel"></section>
+
+<!-- patch -->
+<section class="panel" id="p-patch" role="tabpanel">
+  <div class="note" id="patch-note"></div>
+  <div class="tw"><table id="pt-t">
+    <thead><tr>
+      <th>Image</th><th>Patched tag</th>
+      <th style="text-align:right">OS-pkg before</th><th style="text-align:right">Fixable</th>
+      <th>Status</th>
+      <th style="text-align:right">OS-pkg after</th><th style="text-align:right">Removed</th>
+    </tr></thead><tbody></tbody>
+  </table></div>
+</section>
+
+<footer id="foot"></footer>
+</div>
+<div class="toast" id="toast"></div>
+
+<script>
+/* ====================================================== data (injected) == */
+LAYEROPS_HTML_HEAD
+
+    # image list — every other structure refers to images by index
+    printf 'const IMGS=%s;\n' \
+      "$(printf '%s\n' "${LABELS[@]}" | jq -Rsc 'split("\n")|map(select(length>0))')"
+
+    # one compact row per finding:
+    # [imgIdx, class(0=os,1=lib), type, cve, severity(0-4), pkg, installed, fixed]
+    printf 'const ROWS=[%s];\n' "$(
+    for i in "${!JSONS[@]}"; do
+      jq -c --argjson ix "$i" '
+        def sevi: {"CRITICAL":0,"HIGH":1,"MEDIUM":2,"LOW":3}[.] // 4;
+        .Results[]?
+        | (.Class // "") as $c
+        | select($c == "os-pkgs" or $c == "lang-pkgs")
+        | (.Type // "") as $t
+        | (.Vulnerabilities // [])[]
+        | [ $ix, (if $c == "os-pkgs" then 0 else 1 end), $t,
+            (.VulnerabilityID // ""), ((.Severity // "UNKNOWN") | sevi),
+            (.PkgName // ""), (.InstalledVersion // ""), (.FixedVersion // "") ]
+      ' "${JSONS[$i]}"
+    done | paste -sd, -)"
+
+    # titles stored once per CVE, not once per occurrence
+    printf 'const TITLES=%s;\n' "$(jq -nc '[ inputs | .Results[]?
+              | select((.Class // "") == "os-pkgs" or (.Class // "") == "lang-pkgs")
+              | (.Vulnerabilities // [])[]
+              | select((.Title // "") != "")
+              | {key: .VulnerabilityID, value: .Title} ] | from_entries' "${JSONS[@]}")"
+
+    # per-image summary, same numbers as the terminal table
+    printf 'const IMAGES_SUMMARY=[%s];\n' "$(
+    for i in "${!JSONS[@]}"; do
+      IFS=$'\t' read -r ot of ou <<<"$(counts_row os-pkgs "${JSONS[$i]}")"
+      IFS=$'\t' read -r lt lf lu <<<"$(counts_row lang-pkgs "${JSONS[$i]}")"
+      jq -nc --arg img "${LABELS[$i]}" \
+             --arg ostype  "$(type_for os-pkgs   "${JSONS[$i]}")" \
+             --arg libtype "$(type_for lang-pkgs "${JSONS[$i]}")" \
+             --argjson ot "$ot" --argjson of "$of" \
+             --argjson lt "$lt" --argjson lf "$lf" \
+             '{img:$img, ostype:$ostype, ot:$ot, of:$of,
+               libtype:$libtype, lt:$lt, lf:$lf, gt:($ot+$lt)}'
+    done | paste -sd, -)"
+
+    printf 'const META=%s;\n' "$(jq -nc --arg v "$VERSION" --arg g "$(date '+%Y-%m-%d %H:%M %Z')" \
+           --argjson n "${#JSONS[@]}" --argjson f "$failed_json" \
+           '{version:$v, generated:$g, images:$n, failed:$f}')"
+
+    printf 'const PATCH=%s;\n' "$patch_json"
+
+    cat <<'LAYEROPS_HTML_TAIL'
+/* ====================================================== /data =========== */
+
+(function () {
+"use strict";
+var SEV = ["CRITICAL","HIGH","MEDIUM","LOW","UNKNOWN"];
+var SEVVAR = ["--crit","--high","--med","--low","--unk"];
+var PAGE = 100;
+
+/* ROWS: [imgIdx, cls(0=os,1=lib), type, cve, sev, pkg, installed, fixed] */
+var R_IMG=0, R_CLS=1, R_TYPE=2, R_CVE=3, R_SEV=4, R_PKG=5, R_INST=6, R_FIX=7;
+
+function esc(s){ return String(s==null?"":s); }
+function el(tag, cls, txt){
+  var e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (txt != null) e.textContent = txt;   // never innerHTML for data
+  return e;
+}
+function cveHref(id){
+  if (/^CVE-/i.test(id)) return "https://nvd.nist.gov/vuln/detail/" + encodeURIComponent(id);
+  if (/^GHSA-/i.test(id)) return "https://github.com/advisories/" + encodeURIComponent(id);
+  return "https://www.google.com/search?q=" + encodeURIComponent(id);
+}
+function toast(msg){
+  var t = document.getElementById("toast");
+  t.textContent = msg; t.classList.add("on");
+  clearTimeout(toast._t); toast._t = setTimeout(function(){ t.classList.remove("on"); }, 1900);
+}
+function csvCell(v){
+  v = v == null ? "" : String(v);
+  return /[",\n]/.test(v) ? '"' + v.replace(/"/g,'""') + '"' : v;
+}
+function csvOut(head, rows, name){
+  var text = head.join(",") + "\n" + rows.map(function(r){ return r.map(csvCell).join(","); }).join("\n");
+  var done = function(){ toast(rows.length.toLocaleString() + " rows copied to clipboard"); };
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(done, function(){ fallback(text, name); });
+  } else fallback(text, name);
+}
+function fallback(text, name){
+  try {
+    var b = new Blob([text], {type:"text/csv"});
+    var a = document.createElement("a");
+    a.href = URL.createObjectURL(b); a.download = name;
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    setTimeout(function(){ URL.revokeObjectURL(a.href); }, 4000);
+    toast("Downloaded " + name);
+  } catch (e) { toast("Could not export — select the table and copy manually"); }
+}
+
+/* ------------------------------------------------------------ derived --- */
+var byCls = [[],[]];
+ROWS.forEach(function(r){ byCls[r[R_CLS]].push(r); });
+
+function sevCounts(rows){
+  var c = [0,0,0,0,0];
+  rows.forEach(function(r){ c[r[R_SEV]]++; });
+  return c;
+}
+function fixCounts(rows){
+  var f=0,u=0;
+  rows.forEach(function(r){ if (r[R_FIX]) f++; else u++; });
+  return {fixable:f, unfixed:u};
+}
+
+/* ---------------------------------------------------------------- head --- */
+document.getElementById("m-tool").textContent = "layerops " + (META.version||"");
+document.getElementById("m-when").textContent = META.generated || "";
+var totOs = byCls[0].length, totLib = byCls[1].length;
+
+/* Fixable / unfixed are reported against os-pkgs ALONE. --patch touches distro packages
+   and nothing else, so a blended number would merge automatable patching with
+   library findings that need a dependency bump and an application rebuild. */
+var osFix  = fixCounts(byCls[0]);
+var libFix = fixCounts(byCls[1]);
+var distinctOs  = new Set(byCls[0].map(function(r){ return r[R_CVE]; })).size;
+var distinctLib = new Set(byCls[1].map(function(r){ return r[R_CVE]; })).size;
+
+var patchRan = PATCH && PATCH.length > 0;
+var totalClosed = 0;
+var hasVerified = false;
+var patchOk = 0;
+
+if (patchRan) {
+  var patchVerifiedSum = 0;
+  var patchUnverifiedSum = 0;
+
+  PATCH.forEach(function(p){
+    if (p[4] === "PATCHED") {
+      patchOk++;
+      var rem = (p[6] !== "-" && p[6] !== "ERR" && p[6] !== "" && !isNaN(parseInt(p[6], 10)))
+                ? parseInt(p[6], 10) : null;
+      if (rem !== null) {
+        hasVerified = true;
+        patchVerifiedSum += rem;
+      }
+      var fix = parseInt(p[3], 10) || 0;
+      patchUnverifiedSum += fix;
+    }
+  });
+
+  totalClosed = hasVerified ? patchVerifiedSum : patchUnverifiedSum;
+
+  // Post-patch total OS findings: use osAfter (verified) for patched images,
+  // osBefore for skipped/failed images (nothing changed for them).
+  var postPatchOs = 0;
+  PATCH.forEach(function(p){
+    var osBefore = parseInt(p[2], 10) || 0;
+    var osAfter  = (p[5] !== "-" && p[5] !== "ERR" && p[5] !== "" && !isNaN(parseInt(p[5], 10)))
+                   ? parseInt(p[5], 10) : null;
+    if (p[4] === "PATCHED" && osAfter !== null) {
+      postPatchOs += osAfter;
+    } else {
+      postPatchOs += osBefore;
+    }
+  });
+}
+
+document.getElementById("m-sub").textContent =
+  META.images + " image" + (META.images===1?"":"s") + " scanned · " +
+  (totOs+totLib).toLocaleString() + " findings · " +
+  (new Set(ROWS.map(function(r){return r[R_CVE];})).size).toLocaleString() + " distinct CVEs" +
+  (patchRan && totalClosed > 0
+    ? " · " + totalClosed.toLocaleString() + " closed" + (hasVerified ? "" : " (unverified)")
+    : "");
+
+var PANELS = {};   /* filled in by buildPanel; tiles drive the panels through it */
+
+var tiles = [
+  {lab:"Images scanned", val:META.images,
+   foot:(META.failed && META.failed.length ? META.failed.length+" failed" : "all succeeded")},
+
+  {lab:"Total findings", val:(totOs+totLib),
+   foot:totOs.toLocaleString()+" OS-pkg · "+totLib.toLocaleString()+" lib-pkg"}
+];
+
+if (patchRan && !hasVerified) {
+  /* --patch without --verify: show unverified closed count near the top */
+  var grandTotal = totOs + totLib;
+  var pctTotal = grandTotal > 0 ? Math.round(totalClosed / grandTotal * 100) : 0;
+  tiles.push({
+    lab: "Total closed",
+    val: totalClosed,
+    cls: totalClosed > 0 ? "ok" : (patchOk === 0 ? "crit" : ""),
+    foot: pctTotal + "% of total findings · unverified",
+    go: {tab: "patch", cta: "Patch results"}
+  });
+}
+
+tiles.push(
+  {lab:"OS-pkg fixable", val:osFix.fixable, cls:"ok",
+   foot:(totOs ? Math.round(osFix.fixable/totOs*100) : 0)+"% of OS-pkg",
+   go:{tab:"os", mode:"flat", fix:"fixable", cta:"Distro packages"}},
+
+  {lab:"OS-pkg unfixed", val:osFix.unfixed, cls:"crit",
+   foot:"no vendor patch exists",
+   go:{tab:"os", mode:"flat", fix:"unfixed", cta:"Distro packages"}},
+
+  {lab:"Library findings", val:totLib, cls:"warn",
+   foot:libFix.fixable.toLocaleString()+" have a fix · needs rebuild",
+   go:{tab:"lib", mode:"flat", fix:"", cta:"Libraries"}},
+
+  {lab:"Distinct CVEs · OS-pkg", val:distinctOs, cls:"acc",
+   foot:"unique across "+META.images+" image"+(META.images===1?"":"s"),
+   go:{tab:"os", mode:"cve", fix:"", cta:"List CVEs"}},
+
+  {lab:"Distinct CVEs · Libraries", val:distinctLib, cls:"acc",
+   foot:"unique across "+META.images+" image"+(META.images===1?"":"s"),
+   go:{tab:"lib", mode:"cve", fix:"", cta:"List CVEs"}}
+);
+
+if (patchRan && hasVerified) {
+  var postPatchTotal = postPatchOs + totLib;
+  var postPct = (totOs + totLib) > 0
+    ? Math.round(postPatchTotal / (totOs + totLib) * 100) : 0;
+
+  tiles.push(
+    {
+      lab: "Total closed",
+      val: totalClosed,
+      cls: totalClosed > 0 ? "ok" : (patchOk === 0 ? "crit" : ""),
+      foot: Math.round(totalClosed / (totOs + totLib) * 100) + "% of total findings · verified",
+      go: {tab: "patch", cta: "Patch results"}
+    },
+    {
+      lab: "Total findings post patch",
+      val: postPatchTotal,
+      cls: postPatchTotal < (totOs + totLib) ? "ok" : "",
+      foot: postPatchOs.toLocaleString() + " OS-pkg · " + totLib.toLocaleString() + " lib-pkg · " + postPct + "% of pre-patch",
+      go: {tab: "patch", cta: "Patch results"}
+    }
+  );
+}
+
+var tw = document.getElementById("tiles");
+tiles.forEach(function(t){
+  var d = el(t.go ? "button" : "div", "tile"+(t.cls?" "+t.cls:"")+(t.go?" act":""));
+  if (t.go) d.type = "button";
+  d.appendChild(el("div","lab",t.lab));
+  d.appendChild(el("div","val", Number(t.val).toLocaleString()));
+  d.appendChild(el("div","foot",t.foot));
+  if (t.go) {
+    d.appendChild(el("span","go", t.go.cta + " →"));
+    d.addEventListener("click", function(){
+      select(t.go.tab);
+      var p = PANELS[t.go.tab];
+      if (p) p.apply(t.go.mode, t.go.fix);
+      var host = document.getElementById("p-"+t.go.tab);
+      window.scrollTo({ top: Math.max(0, host.offsetTop - 70), behavior:"smooth" });
+    });
+  }
+  tw.appendChild(d);
+});
+
+/* ---------------------------------------------------------------- tabs --- */
+var TABS = [
+  {id:"ov",   label:"Overview",     n:null},
+  {id:"os",   label:"Distro packages",  n:totOs},
+  {id:"lib",  label:"Libraries",    n:totLib}
+];
+if (PATCH && PATCH.length) TABS.push({id:"patch", label:"Patch results", n:PATCH.length});
+
+var tabsEl = document.getElementById("tabs");
+TABS.forEach(function(t, i){
+  var b = el("button","tab"); b.type="button"; b.setAttribute("role","tab");
+  b.id = "tab-"+t.id; b.setAttribute("aria-controls","p-"+t.id);
+  b.setAttribute("aria-selected", i===0 ? "true":"false");
+  b.appendChild(document.createTextNode(t.label));
+  if (t.n != null) { var s = el("span","n", t.n.toLocaleString()); b.appendChild(s); }
+  b.addEventListener("click", function(){ select(t.id); });
+  tabsEl.appendChild(b);
+});
+function select(id){
+  TABS.forEach(function(t){
+    var on = t.id === id;
+    document.getElementById("tab-"+t.id).setAttribute("aria-selected", on?"true":"false");
+    document.getElementById("p-"+t.id).classList.toggle("on", on);
+  });
+}
+select("ov");
+
+/* -------------------------------------------------------------- ribbons -- */
+function ribbon(rows){
+  var frag = document.createDocumentFragment();
+  var c = sevCounts(rows), tot = rows.length || 1;
+  var bar = el("div","ribbon");
+  c.forEach(function(n, i){
+    if (!n) return;
+    var s = document.createElement("span");
+    s.style.width = (n/tot*100) + "%";
+    s.style.background = "var(" + SEVVAR[i] + ")";
+    s.title = SEV[i] + ": " + n.toLocaleString();
+    bar.appendChild(s);
+  });
+  frag.appendChild(bar);
+  var lg = el("div","rlegend");
+  c.forEach(function(n, i){
+    if (!n) return;
+    var sp = el("span");
+    var sw = el("i"); sw.style.background = "var(" + SEVVAR[i] + ")";
+    sp.appendChild(sw);
+    sp.appendChild(document.createTextNode(SEV[i] + " " + n.toLocaleString()));
+    lg.appendChild(sp);
+  });
+  frag.appendChild(lg);
+  return frag;
+}
+var ovr = document.getElementById("ov-ribbons");
+[["Distro packages", byCls[0]], ["Libraries", byCls[1]]].forEach(function(p){
+  if (!p[1].length) return;
+  var h = el("div", null);
+  var lab = el("div", null, p[0] + " — " + p[1].length.toLocaleString() + " findings");
+  lab.style.cssText = "font-size:12px;font-weight:600;color:var(--ink);margin-bottom:6px";
+  h.appendChild(lab); h.appendChild(ribbon(p[1]));
+  ovr.appendChild(h);
+});
+
+/* ------------------------------------------------------------- overview -- */
+var ovSort = {k:"gt", dir:-1};
+function ovRows(){
+  var q = document.getElementById("ov-q").value.trim().toLowerCase();
+  var rows = IMAGES_SUMMARY.filter(function(r){ return !q || r.img.toLowerCase().indexOf(q) >= 0; });
+  var k = ovSort.k, d = ovSort.dir;
+  return rows.sort(function(a,b){
+    var x=a[k], y=b[k];
+    if (typeof x === "string") return d * x.localeCompare(y);
+    return d * (x - y);
+  });
+}
+function drawOv(){
+  var tb = document.querySelector("#ov-t tbody");
+  tb.textContent = "";
+  var rows = ovRows();
+  rows.forEach(function(r){
+    var tr = document.createElement("tr");
+    tr.appendChild(el("td","m", r.img));
+    tr.appendChild(el("td", null, r.ostype || "—"));
+    tr.appendChild(el("td","num", r.ot.toLocaleString()));
+    tr.appendChild(el("td","num", r.of.toLocaleString()));
+    tr.appendChild(el("td", null, r.libtype || "—"));
+    tr.appendChild(el("td","num", r.lt.toLocaleString()));
+    tr.appendChild(el("td","num", r.lf.toLocaleString()));
+    tr.appendChild(el("td","num", r.gt.toLocaleString()));
+    tb.appendChild(tr);
+  });
+  document.getElementById("ov-empty").textContent = rows.length ? "" : "No images match that filter.";
+  markSort("#ov-t", ovSort);
+}
+document.getElementById("ov-q").addEventListener("input", drawOv);
+document.querySelectorAll("#ov-t th.s").forEach(function(th){
+  th.addEventListener("click", function(){
+    var k = th.dataset.k;
+    ovSort = {k:k, dir: ovSort.k===k ? -ovSort.dir : (k==="img"||k==="ostype"||k==="libtype" ? 1 : -1)};
+    drawOv();
+  });
+});
+document.getElementById("ov-csv").addEventListener("click", function(){
+  csvOut(["image","os_type","os_total","os_fixable","lib_type","lib_total","lib_fixable","grand_total"],
+    ovRows().map(function(r){ return [r.img,r.ostype,r.ot,r.of,r.libtype,r.lt,r.lf,r.gt]; }),
+    "layerops-images.csv");
+});
+function markSort(sel, st){
+  document.querySelectorAll(sel + " th.s .ar").forEach(function(a){ a.textContent = ""; });
+  var th = document.querySelector(sel + ' th.s[data-k="' + st.k + '"] .ar');
+  if (th) th.textContent = st.dir > 0 ? "▲" : "▼";
+}
+drawOv();
+
+/* ------------------------------------------------- CVE panels (os / lib) - */
+function buildPanel(cls, host){
+  var rows = byCls[cls];
+  /* mode: "cve"  one row per distinct CVE  (matches the Distinct CVEs tile exactly)
+           "pair" one row per CVE + package (the remediation unit)
+           "flat" one row per occurrence, per image                                */
+  var state = {q:"", sev:new Set(), fix:"", img:"", mode:"cve", sort:{k:"sev",dir:1}, page:0};
+
+  /* --- controls --- */
+  var f = el("div","filters");
+  var sw = el("div","search");
+  var inp = document.createElement("input");
+  inp.type="search"; inp.placeholder="Search CVE, package, image…"; inp.setAttribute("aria-label","Search findings");
+  sw.appendChild(inp); f.appendChild(sw);
+
+  var chips = el("div","chips");
+  SEV.forEach(function(s, i){
+    var c = el("button","chip"); c.type="button"; c.dataset.sev=i;
+    c.setAttribute("aria-pressed","false"); c.textContent = s;
+    c.addEventListener("click", function(){
+      if (state.sev.has(i)) state.sev.delete(i); else state.sev.add(i);
+      c.setAttribute("aria-pressed", state.sev.has(i)?"true":"false");
+      state.page=0; draw();
+    });
+    chips.appendChild(c);
+  });
+  f.appendChild(chips);
+
+  var fixc = el("div","chips");
+  [["fixable","Fixable"],["unfixed","Unfixed"]].forEach(function(p){
+    var c = el("button","chip fx"); c.type="button"; c.textContent = p[1];
+    c.setAttribute("aria-pressed","false");
+    c.addEventListener("click", function(){
+      state.fix = state.fix === p[0] ? "" : p[0];
+      fixc.querySelectorAll(".chip").forEach(function(o){ o.setAttribute("aria-pressed","false"); });
+      if (state.fix) c.setAttribute("aria-pressed","true");
+      state.page=0; draw();
+    });
+    fixc.appendChild(c);
+  });
+  f.appendChild(fixc);
+  host.appendChild(f);
+
+  var f2 = el("div","filters");
+  var isel = document.createElement("select"); isel.className="sel"; isel.setAttribute("aria-label","Filter by image");
+  var o0 = document.createElement("option"); o0.value=""; o0.textContent="All images"; isel.appendChild(o0);
+  var imgsHere = [];
+  var seen = {};
+  rows.forEach(function(r){ if(!seen[r[R_IMG]]){ seen[r[R_IMG]]=1; imgsHere.push(r[R_IMG]); } });
+  imgsHere.sort(function(a,b){ return IMGS[a].localeCompare(IMGS[b]); }).forEach(function(ix){
+    var o = document.createElement("option"); o.value = ix; o.textContent = IMGS[ix]; isel.appendChild(o);
+  });
+  isel.addEventListener("change", function(){ state.img = isel.value; state.page=0; draw(); });
+  f2.appendChild(isel);
+
+  var msel = document.createElement("select"); msel.className="sel"; msel.setAttribute("aria-label","Row grouping");
+  [["cve","One row per distinct CVE"],["pair","One row per CVE + package"],["flat","One row per image"]]
+    .forEach(function(p){
+      var o = document.createElement("option"); o.value=p[0]; o.textContent=p[1]; msel.appendChild(o);
+    });
+  msel.value = state.mode;
+  msel.addEventListener("change", function(){
+    state.mode = msel.value; state.sort = {k:"sev", dir:1}; state.page = 0; draw();
+  });
+  f2.appendChild(msel);
+
+  f2.appendChild(el("div","spacer"));
+  var cbtn = el("button","btn pri"); cbtn.type="button"; cbtn.textContent="Copy filtered as CSV";
+  f2.appendChild(cbtn);
+  host.appendChild(f2);
+
+  var rib = el("div"); host.appendChild(rib);
+
+  var tw2 = el("div","tw");
+  var table = document.createElement("table");
+  var thead = document.createElement("thead");
+  var tbody = document.createElement("tbody");
+  table.appendChild(thead); table.appendChild(tbody);
+  tw2.appendChild(table); host.appendChild(tw2);
+
+  var emptyEl = el("div","empty"); emptyEl.style.display="none"; host.appendChild(emptyEl);
+
+  var pager = el("div","pager");
+  var prev = el("button","btn"); prev.type="button"; prev.textContent="← Prev";
+  var next = el("button","btn"); next.type="button"; next.textContent="Next →";
+  var info = el("span","info");
+  pager.appendChild(prev); pager.appendChild(next); pager.appendChild(info);
+  host.appendChild(pager);
+
+  var deb;
+  inp.addEventListener("input", function(){
+    clearTimeout(deb);
+    deb = setTimeout(function(){ state.q = inp.value.trim().toLowerCase(); state.page=0; draw(); }, 140);
+  });
+  prev.addEventListener("click", function(){ if (state.page>0){ state.page--; draw(); window.scrollTo({top:tw2.offsetTop-90}); } });
+  next.addEventListener("click", function(){ state.page++; draw(); window.scrollTo({top:tw2.offsetTop-90}); });
+
+  /* --- filtering --- */
+  function filtered(){
+    var q = state.q, hasSev = state.sev.size > 0, img = state.img === "" ? null : +state.img;
+    return rows.filter(function(r){
+      if (hasSev && !state.sev.has(r[R_SEV])) return false;
+      if (state.fix === "fixable" && !r[R_FIX]) return false;
+      if (state.fix === "unfixed" && r[R_FIX]) return false;
+      if (img !== null && r[R_IMG] !== img) return false;
+      if (q) {
+        if (r[R_CVE].toLowerCase().indexOf(q) < 0 &&
+            r[R_PKG].toLowerCase().indexOf(q) < 0 &&
+            IMGS[r[R_IMG]].toLowerCase().indexOf(q) < 0 &&
+            String(r[R_TYPE]).toLowerCase().indexOf(q) < 0) return false;
+      }
+      return true;
+    });
+  }
+  /* group by CVE+package (mode "pair") or by CVE alone (mode "cve") */
+  function grouped(rs, byCveOnly){
+    var m = new Map();
+    rs.forEach(function(r){
+      var key = byCveOnly ? r[R_CVE] : (r[R_CVE] + "\u0001" + r[R_PKG]);
+      var g = m.get(key);
+      if (!g) {
+        g = {cve:r[R_CVE], pkg:r[R_PKG], sev:r[R_SEV],
+             pkgs:new Set(), inst:new Set(), imgs:new Set(),
+             fixed:0, unfixed:0, fixVers:new Set()};
+        m.set(key, g);
+      }
+      if (r[R_SEV] < g.sev) g.sev = r[R_SEV];          /* most severe wins */
+      g.pkgs.add(r[R_PKG]); g.inst.add(r[R_INST]); g.imgs.add(r[R_IMG]);
+      if (r[R_FIX]) { g.fixed++; g.fixVers.add(r[R_FIX]); } else { g.unfixed++; }
+    });
+    /* one fix label per group: a version when unambiguous, else the split */
+    m.forEach(function(g){
+      if (g.fixed && !g.unfixed) g.fix = g.fixVers.size === 1 ? Array.from(g.fixVers)[0] : "fix available";
+      else if (g.fixed && g.unfixed) g.fix = "partial";
+      else g.fix = "";
+    });
+    return Array.from(m.values());
+  }
+  function sortRows(list){
+    var k = state.sort.k, d = state.sort.dir, flat = state.mode === "flat";
+    return list.sort(function(a,b){
+      var x,y;
+      if (!flat) {
+        if (k==="sev"){x=a.sev;y=b.sev;} else if (k==="cve"){x=a.cve;y=b.cve;}
+        else if (k==="pkg"){ x = state.mode==="cve" ? a.pkgs.size : a.pkg;
+                             y = state.mode==="cve" ? b.pkgs.size : b.pkg; }
+        else if (k==="imgs"){x=a.imgs.size;y=b.imgs.size;}
+        else {x=a.fixed?1:0;y=b.fixed?1:0;}
+      } else {
+        if (k==="sev"){x=a[R_SEV];y=b[R_SEV];} else if (k==="cve"){x=a[R_CVE];y=b[R_CVE];}
+        else if (k==="pkg"){x=a[R_PKG];y=b[R_PKG];} else if (k==="img"){x=IMGS[a[R_IMG]];y=IMGS[b[R_IMG]];}
+        else {x=a[R_FIX]?1:0;y=b[R_FIX]?1:0;}
+      }
+      if (typeof x === "string") return d * x.localeCompare(y);
+      return d * (x - y);
+    });
+  }
+  /* "N things", expandable when there is more than one */
+  function setCell(td, items, noun) {
+    if (items.length === 1) { td.appendChild(el("span","imgs", items[0])); return; }
+    var dt = document.createElement("details"); dt.className = "imgd";
+    var sm = document.createElement("summary"); sm.textContent = items.length + " " + noun;
+    dt.appendChild(sm);
+    var ul = document.createElement("ul");
+    items.slice().sort().forEach(function(v){ ul.appendChild(el("li", null, v)); });
+    dt.appendChild(ul); td.appendChild(dt);
+  }
+
+  function header(cols){
+    thead.textContent = "";
+    var tr = document.createElement("tr");
+    cols.forEach(function(c){
+      var th = el("th", c.k ? "s" : null, c.label);
+      if (c.right) th.style.textAlign = "right";
+      if (c.k) {
+        th.dataset.k = c.k;
+        var ar = el("span","ar", state.sort.k===c.k ? (state.sort.dir>0?"▲":"▼") : "");
+        th.appendChild(ar);
+        th.addEventListener("click", function(){
+          state.sort = {k:c.k, dir: state.sort.k===c.k ? -state.sort.dir : (c.k==="sev"?1:1)};
+          state.page = 0; draw();
+        });
+      }
+      tr.appendChild(th);
+    });
+    thead.appendChild(tr);
+  }
+
+  function draw(){
+    var fl = filtered();
+    rib.textContent = ""; rib.appendChild(ribbon(fl));
+
+    var list = state.mode === "flat" ? fl.slice() : grouped(fl, state.mode === "cve");
+    sortRows(list);
+
+    var pages = Math.max(1, Math.ceil(list.length / PAGE));
+    if (state.page >= pages) state.page = pages - 1;
+    var start = state.page * PAGE, slice = list.slice(start, start + PAGE);
+
+    if (state.mode === "cve") {
+      header([{label:"CVE",k:"cve"},{label:"Severity",k:"sev"},{label:"Packages",k:"pkg",right:true},
+              {label:"Fix",k:"fix"},{label:"Images",k:"imgs",right:true},{label:"Title"}]);
+    } else if (state.mode === "pair") {
+      header([{label:"CVE",k:"cve"},{label:"Severity",k:"sev"},{label:"Package",k:"pkg"},
+              {label:"Installed"},{label:"Fixed in",k:"fix"},{label:"Images",k:"imgs",right:true},{label:"Title"}]);
+    } else {
+      header([{label:"CVE",k:"cve"},{label:"Severity",k:"sev"},{label:"Image",k:"img"},
+              {label:"Type"},{label:"Package",k:"pkg"},{label:"Installed"},{label:"Fixed in",k:"fix"}]);
+    }
+
+    tbody.textContent = "";
+    slice.forEach(function(g){
+      var tr = document.createElement("tr");
+      if (state.mode === "cve") {
+        var tdc = document.createElement("td");
+        var ac = el("a","cve", g.cve); ac.href = cveHref(g.cve); ac.target="_blank"; ac.rel="noopener noreferrer";
+        tdc.appendChild(ac); tr.appendChild(tdc);
+
+        var tsc = document.createElement("td");
+        tsc.appendChild(el("span","sev sev"+g.sev, SEV[g.sev])); tr.appendChild(tsc);
+
+        var tp = document.createElement("td"); tp.style.textAlign = "right";
+        setCell(tp, Array.from(g.pkgs), "packages"); tr.appendChild(tp);
+
+        var tfx = document.createElement("td");
+        if (g.fix === "partial") tfx.appendChild(el("span","nofix","partial"));
+        else if (g.fix) tfx.appendChild(el("span","fixv", g.fix));
+        else tfx.appendChild(el("span","nofix","no fix"));
+        tr.appendChild(tfx);
+
+        var tic = document.createElement("td"); tic.style.textAlign = "right";
+        setCell(tic, Array.from(g.imgs).map(function(i){ return IMGS[i]; }), "images");
+        tr.appendChild(tic);
+
+        tr.appendChild(el("td","ttl", TITLES[g.cve] || ""));
+      } else if (state.mode === "pair") {
+        var td = document.createElement("td");
+        var a = el("a","cve", g.cve); a.href = cveHref(g.cve); a.target="_blank"; a.rel="noopener noreferrer";
+        td.appendChild(a); tr.appendChild(td);
+
+        var ts = document.createElement("td");
+        ts.appendChild(el("span","sev sev"+g.sev, SEV[g.sev])); tr.appendChild(ts);
+
+        tr.appendChild(el("td","m", g.pkg));
+        tr.appendChild(el("td","m", Array.from(g.inst).slice(0,2).join(", ") + (g.inst.size>2 ? " +"+(g.inst.size-2) : "")));
+
+        var tf = document.createElement("td");
+        if (g.fix === "partial") tf.appendChild(el("span","nofix","partial"));
+        else if (g.fix) tf.appendChild(el("span","fixv", g.fix));
+        else tf.appendChild(el("span","nofix","no fix"));
+        tr.appendChild(tf);
+
+        var ti = document.createElement("td"); ti.style.textAlign="right";
+        if (g.imgs.size === 1) {
+          ti.appendChild(el("span","imgs","1"));
+        } else {
+          var d = document.createElement("details"); d.className="imgd";
+          var s = document.createElement("summary"); s.textContent = g.imgs.size + " images";
+          d.appendChild(s);
+          var ul = document.createElement("ul");
+          Array.from(g.imgs).sort(function(a,b){return IMGS[a].localeCompare(IMGS[b]);})
+            .forEach(function(ix){ ul.appendChild(el("li", null, IMGS[ix])); });
+          d.appendChild(ul); ti.appendChild(d);
+        }
+        tr.appendChild(ti);
+        tr.appendChild(el("td","ttl", TITLES[g.cve] || ""));
+      } else {
+        var td2 = document.createElement("td");
+        var a2 = el("a","cve", g[R_CVE]); a2.href = cveHref(g[R_CVE]); a2.target="_blank"; a2.rel="noopener noreferrer";
+        td2.appendChild(a2); tr.appendChild(td2);
+
+        var ts2 = document.createElement("td");
+        ts2.appendChild(el("span","sev sev"+g[R_SEV], SEV[g[R_SEV]])); tr.appendChild(ts2);
+
+        tr.appendChild(el("td","m", IMGS[g[R_IMG]]));
+        tr.appendChild(el("td", null, g[R_TYPE] || "—"));
+        tr.appendChild(el("td","m", g[R_PKG]));
+        tr.appendChild(el("td","m", g[R_INST]));
+        var tf2 = document.createElement("td");
+        if (g[R_FIX]) tf2.appendChild(el("span","fixv", g[R_FIX]));
+        else tf2.appendChild(el("span","nofix","no fix"));
+        tr.appendChild(tf2);
+      }
+      tbody.appendChild(tr);
+    });
+
+    emptyEl.style.display = list.length ? "none" : "block";
+    emptyEl.textContent = list.length ? "" : "Nothing matches these filters.";
+    info.textContent = list.length
+      ? ((start+1).toLocaleString() + "–" + Math.min(start+PAGE, list.length).toLocaleString() +
+         " of " + list.length.toLocaleString() +
+         (state.mode === "cve" ? " distinct CVEs" : state.mode === "pair" ? " CVE/package pairs" : " findings") +
+         "  ·  page " + (state.page+1) + " of " + pages)
+      : "0 results";
+    prev.disabled = state.page === 0;
+    next.disabled = state.page >= pages - 1;
+    prev.style.opacity = prev.disabled ? .4 : 1;
+    next.style.opacity = next.disabled ? .4 : 1;
+
+    cbtn.onclick = function(){
+      if (state.mode === "cve") {
+        csvOut(["cve","severity","packages","fix","image_count","images","title"],
+          list.map(function(g){
+            return [g.cve, SEV[g.sev], Array.from(g.pkgs).join(" | "),
+                    g.fix || "no fix", g.imgs.size,
+                    Array.from(g.imgs).map(function(i){return IMGS[i];}).join(" | "),
+                    TITLES[g.cve] || ""];
+          }), "layerops-" + (cls?"lib":"os") + "-distinct-cves.csv");
+      } else if (state.mode === "pair") {
+        csvOut(["cve","severity","package","installed","fixed_version","image_count","images","title"],
+          list.map(function(g){
+            return [g.cve, SEV[g.sev], g.pkg, Array.from(g.inst).join(" | "), g.fix || "no fix",
+                    g.imgs.size, Array.from(g.imgs).map(function(i){return IMGS[i];}).join(" | "),
+                    TITLES[g.cve] || ""];
+          }), "layerops-" + (cls?"lib":"os") + "-cves.csv");
+      } else {
+        csvOut(["cve","severity","image","type","package","installed","fixed_version","title"],
+          list.map(function(r){
+            return [r[R_CVE], SEV[r[R_SEV]], IMGS[r[R_IMG]], r[R_TYPE], r[R_PKG], r[R_INST], r[R_FIX] || "",
+                    TITLES[r[R_CVE]] || ""];
+          }), "layerops-" + (cls?"lib":"os") + "-findings.csv");
+      }
+    };
+  }
+  draw();
+
+  PANELS[cls ? "lib" : "os"] = {
+    apply: function(mode, fix){
+      if (mode) { state.mode = mode; msel.value = mode; }
+      state.fix = fix || "";
+      fixc.querySelectorAll(".chip").forEach(function(c, i){
+        c.setAttribute("aria-pressed",
+          (state.fix === "fixable" && i === 0) || (state.fix === "unfixed" && i === 1) ? "true" : "false");
+      });
+      state.page = 0;
+      state.sort = {k:"sev", dir:1};
+      draw();
+    }
+  };
+}
+
+/* each class gets a one-line statement of what remediation actually means there,
+   so nobody reads a lib "fixable" count as something --patch will clear */
+function classNote(host, kind){
+  var n = el("div", "note" + (kind === "lib" ? " warn" : ""));
+  if (kind === "os") {
+    n.appendChild(el("b", null, "Patchable by layerops. "));
+    n.appendChild(document.createTextNode(
+      "These are distro packages. Where a fixed version exists, layerops --patch rebuilds the "
+      + "package layer in place — no application change required. Fixable and Unfixed on the "
+      + "overview count these findings only."));
+  } else {
+    n.appendChild(el("b", null, "Not patchable in place. "));
+    n.appendChild(document.createTextNode(
+      "These are compiled into the application — jar, Go binary, npm, pip. A “fixed version” "
+      + "here means an upstream release exists, not that anything can apply it: each one needs a "
+      + "dependency bump, a rebuild and a redeploy. layerops --patch never touches them, so they are "
+      + "excluded from the Fixable and Unfixed figures on the overview."));
+  }
+  host.appendChild(n);
+}
+
+if (byCls[0].length) { classNote(document.getElementById("p-os"), "os"); buildPanel(0, document.getElementById("p-os")); }
+else document.getElementById("p-os").appendChild(el("div","empty","No distro package findings."));
+if (byCls[1].length) { classNote(document.getElementById("p-lib"), "lib"); buildPanel(1, document.getElementById("p-lib")); }
+else document.getElementById("p-lib").appendChild(el("div","empty","No library findings."));
+
+/* ---------------------------------------------------------------- patch -- */
+if (PATCH && PATCH.length) {
+  var ok = PATCH.filter(function(p){return p[4]==="PATCHED";}).length;
+  var bad = PATCH.filter(function(p){return p[4]==="FAILED";}).length;
+  var skip = PATCH.filter(function(p){return p[4]==="SKIPPED";}).length;
+  var n = document.getElementById("patch-note");
+  n.textContent = "";
+  var b = el("b", null, "layerops patches distro packages only. ");
+  n.appendChild(b);
+  n.appendChild(document.createTextNode(
+    ok + " patched, " + bad + " failed, " + skip + " skipped. Library findings are never affected by --patch — " +
+    "they need a dependency bump and an application rebuild."));
+  var ptb = document.querySelector("#pt-t tbody");
+  PATCH.forEach(function(p){
+    var tr = document.createElement("tr");
+    tr.appendChild(el("td","m",p[0]));
+    tr.appendChild(el("td","m",p[1]));
+    var a=el("td","num",p[2]); tr.appendChild(a);
+    var bcell=el("td","num",p[3]); tr.appendChild(bcell);
+    var st=document.createElement("td");
+    st.appendChild(el("span","status st-"+p[4], p[4])); tr.appendChild(st);
+    tr.appendChild(el("td","num",p[5]));
+    tr.appendChild(el("td","num",p[6]));
+    ptb.appendChild(tr);
+  });
+}
+
+/* --------------------------------------------------------------- footer -- */
+var ft = document.getElementById("foot");
+var parts = ["Generated by layerops " + (META.version||"") + " using Trivy" + (PATCH && PATCH.length ? " and Copacetic" : "") + "."];
+if (META.failed && META.failed.length) parts.push(META.failed.length + " image(s) failed to scan: " + META.failed.join(", ") + ".");
+parts.push("Findings are raw occurrences; distinct CVE counts are deduplicated. Severity is Trivy's, which may draw on multiple vendor sources.");
+ft.textContent = parts.join(" ");
+})();
+</script>
+</body>
+</html>
+LAYEROPS_HTML_TAIL
+  } > "$out"
+}
+
+if [[ -n "$HTML_OUT" ]]; then
+  write_html "$HTML_OUT"
+  printf '%s: wrote %s (%s)\n' "$PROG" "$HTML_OUT" \
+    "$(du -h "$HTML_OUT" 2>/dev/null | cut -f1 | tr -d ' ')" >&2
+fi
+
+# ------------------------------------------------------------------ footer ---
+if [[ ${#FAILED[@]} -gt 0 ]]; then
+  printf '%s: %d image(s) failed to scan:\n' "$PROG" "${#FAILED[@]}" >&2
+  printf '  %s\n' "${FAILED[@]}" >&2
+fi
+
+if [[ ${#PATCH_FAILED_IMGS[@]} -gt 0 ]]; then
+  printf '%s: %d image(s) failed to patch:\n' "$PROG" "${#PATCH_FAILED_IMGS[@]}" >&2
+  printf '  %s\n' "${PATCH_FAILED_IMGS[@]}" >&2
+fi
+
+if [[ "$FAIL_ON_FIXABLE" -eq 1 ]]; then
+  n="$(jq -rn '[ inputs | .Results[]?.Vulnerabilities[]? | select((.FixedVersion // "") != "") ] | length' "${JSONS[@]}")"
+  if [[ "$n" -gt 0 ]]; then
+    printf '%s: %s fixable vulnerabilities found\n' "$PROG" "$n" >&2
+    exit 1
+  fi
+fi

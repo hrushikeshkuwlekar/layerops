@@ -12,6 +12,7 @@
 *.html
 *.csv
 !sample-report.html
+!index.html
 
 # Editor
 .vscode/

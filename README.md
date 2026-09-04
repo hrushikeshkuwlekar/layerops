@@ -111,28 +111,37 @@ Patch (Copacetic):
 
 ## How Patching Works
 
-```
-+----------------------------------------------------------+
-|  Pass 1: copa patch -i <img> -r <trivy-report> -t <tag>  |
-|  (precise — only CVE-confirmed packages)                  |
-+---------------+------------------+------------------------+
-             success            failure
-                |                  |
-                v                  v
-            PATCHED   +---------------------------------+
-                      |  Pass 2: copa patch -i <img>    |
-                      |  -t <tag> --ignore-errors        |
-                      |  --platform <host-native-arch>   |
-                      |  (comprehensive, skips errors)   |
-                      +-------+----------+---------------+
-                           success    failure
-                              |          |
-                              v          v
-                          PATCHED     FAILED
+```mermaid
+flowchart TD
+    A([🐳 Source Image]) --> B
+
+    B["⚡ Pass 1 — Precise\ncopa patch -i img -r trivy-report -t tag\nTargets only CVE-confirmed packages"]
+
+    B -->|✅ success| C(["✅ PATCHED\nnew tag written locally"])
+    B -->|❌ failure| D["🔁 Pass 2 — Comprehensive\ncopa patch -i img -t tag\n--ignore-errors  --platform host-arch\nFull distro upgrade, skips pkg errors\nPinned to native arch — no QEMU"]
+
+    D -->|✅ success| E["🔍 Tag normalisation\ndocker tag arch-suffixed-img → expected-ref\ne.g. mysql:8.4-lo-delta-arm64 → mysql:8.4-lo-delta"]
+    D -->|❌ failure| F(["❌ FAILED\nreported, run continues"])
+
+    E --> C
+
+    C -->|"--verify flag"| G["🔬 Re-scan with Trivy\ncompares before vs after"]
+    G --> H(["📊 Report\nOS Before → OS After\nfindings closed"])
+
+    style A fill:#1e3a5f,color:#fff,stroke:#4a9eff
+    style B fill:#2d4a7a,color:#fff,stroke:#4a9eff
+    style C fill:#1a4731,color:#fff,stroke:#2ea84a
+    style D fill:#4a3520,color:#fff,stroke:#f59e0b
+    style E fill:#3a2d5f,color:#fff,stroke:#a78bfa
+    style F fill:#4a1a1a,color:#fff,stroke:#f87171
+    style G fill:#1a3a4a,color:#fff,stroke:#38bdf8
+    style H fill:#1a4731,color:#fff,stroke:#2ea84a
 ```
 
-- Pass 2 is pinned to the **host's native CPU architecture** (e.g. `linux/arm64` on Apple Silicon, `linux/amd64` on x86). This avoids extremely slow QEMU emulation timeouts when patching multi-arch images.
-- The patched image is always tagged to the expected ref so `--verify` and the HTML report work correctly.
+- **Pass 1** is precise — it uses the Trivy report to target only packages with known CVEs and fixed versions.
+- **Pass 2** triggers automatically on any Pass 1 failure (epoch mismatches, Oracle Linux rejection, etc.) — it runs a full distro upgrade with `--ignore-errors` to skip individual package failures.
+- **Native arch pinning** — Pass 2 is pinned to the host CPU (e.g. `linux/arm64` on Apple Silicon) to avoid QEMU emulation timeouts on multi-arch images.
+- **Tag normalisation** — Docker Hub library images are stored without the `docker.io/library/` prefix and with an arch suffix (e.g. `mysql:8.4-lo-delta-arm64`). `layerops` detects and aliases these to the expected ref so `--verify` and reports work correctly.
 
 ---
 

@@ -1,0 +1,104 @@
+# Open-source container images
+# Format: full image reference (registry/repo:tag)
+
+# cert-manager (quay.io/jetstack/)
+quay.io/jetstack/cert-manager-cainjector:v1.21.1
+quay.io/jetstack/cert-manager-controller:v1.21.1
+quay.io/jetstack/cert-manager-webhook:v1.21.1
+
+# cilium (quay.io/cilium/)
+#(Main agent & CNI daemonset)
+quay.io/cilium/cilium:v1.19.5
+#(Generic cluster operator)
+quay.io/cilium/operator-generic:v1.19.5
+#(Hubble Relay service)
+quay.io/cilium/hubble-relay:v1.19.5 
+#(Hubble UI frontend)
+quay.io/cilium/hubble-ui:v0.13.2 
+#(Hubble UI backend)
+quay.io/cilium/hubble-ui-backend:v0.13.2 
+
+# fluent-bit
+cr.fluentbit.io/fluent/fluent-bit:4.2.2
+
+# grafana
+docker.io/grafana/grafana:13.1.1
+
+# nginx
+docker.io/library/nginx:1.30.3
+
+# drupal
+drupal:latest
+
+# redis
+ecr-public.aws.com/docker/library/redis:8.2.3-alpine
+
+# external-secrets operator
+ghcr.io/external-secrets/external-secrets:v2.5.0
+
+# kube-webhook-certgen
+ghcr.io/jkroepke/kube-webhook-certgen:1.7.4
+
+# jaeger
+docker.io/jaegertracing/jaeger:2.19.0
+
+# kafka / strimzi
+quay.io/strimzi/kafka:0.51.0-kafka-4.1.1
+quay.io/strimzi/operator:0.51.0
+
+# karpenter
+public.ecr.aws/karpenter/controller:1.12.1
+
+# keycloak
+quay.io/keycloak/keycloak:latest
+# keycloak:26.6.4-theme-plugin-v1  ?? (likely internal build with custom theme)
+
+# kyverno (ghcr.io/kyverno/)
+ghcr.io/kyverno/kyverno:v1.18.1
+ghcr.io/kyverno/background-controller:v1.18.1
+ghcr.io/kyverno/reports-controller:v1.18.1
+ghcr.io/kyverno/cleanup-controller:v1.18.1
+ghcr.io/kyverno/kyvernopre:v1.18.1
+
+# mysql
+docker.io/library/mysql:8.4
+
+# OpenKM
+# Latest Community Edition
+docker.io/openkm/openkm-ce:latest
+
+# Specific stable CE version
+#docker.io/openkm/openkm-ce:6.3.12
+#docker.io/openkm/openkm-ce:6.3.11
+#docker.io/openkm/openkm-ce:7.0.14
+
+# opentelemetry
+ghcr.io/open-telemetry/opentelemetry-operator/opentelemetry-operator:0.150.0
+docker.io/otel/opentelemetry-collector-contrib:0.153.0
+
+# ArgoCD
+quay.io/argoproj/argocd:v3.4.5
+ghcr.io/dexidp/dex:v2.45.1
+
+# k8s-sidecar
+quay.io/kiwigrid/k8s-sidecar:2.7.3
+
+# prometheus
+quay.io/prometheus/node-exporter:v1.11.1
+quay.io/prometheus/prometheus:v3.12.0
+quay.io/prometheus-operator/prometheus-operator:v0.92.0
+
+# thanos
+quay.io/thanos/thanos:v0.41.0
+
+# airbyte
+docker.io/airbyte/server:2.1.0
+docker.io/airbyte/worker:2.1.0
+docker.io/airbyte/cron:2.1.0
+docker.io/airbyte/bootloader:2.1.0
+
+# temporal
+docker.io/temporalio/auto-setup:1.27.2
+
+# minio
+quay.io/minio/minio:RELEASE.2023-11-20T22-40-07Z

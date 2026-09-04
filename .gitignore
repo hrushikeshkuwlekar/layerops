@@ -11,6 +11,7 @@
 # Reports (don't commit generated reports)
 *.html
 *.csv
+!sample-report.html
 
 # Editor
 .vscode/

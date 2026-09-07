@@ -30,23 +30,33 @@ layerops unifies [Trivy](https://github.com/aquasecurity/trivy) scanning and [Co
 - **CSV report** — per-image + per-severity + per-CVE rows for downstream tooling
 - **CI gate** — `--fail-on-fixable` exits 1 if any fixable vulnerability is found
 
----
-
-## Requirements
+## Dependencies
 
 | Tool | Purpose | macOS | Linux |
 |---|---|---|---|
 | [Trivy](https://github.com/aquasecurity/trivy) | Vulnerability scanning | `brew install trivy` | `apt install trivy` or see [Trivy install](https://aquasecurity.github.io/trivy/latest/getting-started/installation/) |
 | [Copacetic (copa)](https://github.com/project-copacetic/copacetic) | OS package patching | `brew install copa` or see [copa install](https://project-copacetic.github.io/copacetic/website/installation) | `curl -sSL https://raw.githubusercontent.com/project-copacetic/copacetic/main/scripts/install.sh \| sh` |
 | [jq](https://stedolan.github.io/jq/) | JSON processing | `brew install jq` | `apt install jq` / `yum install jq` |
-| Docker (or any BuildKit daemon) | Image pull / push / BuildKit backend | [Docker Desktop](https://docs.docker.com/get-docker/) · docker run -d --name buildkitd --privileged moby/buildkit | [Docker Engine](https://docs.docker.com/engine/install/) · `docker run -d --name buildkitd --privileged moby/buildkit` |
+| Docker (or any BuildKit daemon) | Image pull / push / BuildKit backend | [Docker Desktop](https://docs.docker.com/get-docker/) · `docker run -d --name buildkitd --privileged moby/buildkit` | [Docker Engine](https://docs.docker.com/engine/install/) · `docker run -d --name buildkitd --privileged moby/buildkit` |
+
+> [!TIP]
+> The install script below handles **all** of these automatically — you don't need to install them manually.
 
 ---
 
 ## Installation
 
+**One command installs everything** — layerops and all its dependencies:
+
 ```bash
-# Download and make executable
+curl -sSL https://raw.githubusercontent.com/hrushikeshkuwlekar/layerops/main/scripts/install.sh | bash
+```
+
+The installer auto-detects your OS and architecture, skips tools already installed, and sets up the BuildKit container for patching.
+
+**Or install layerops only** (if you already have the dependencies):
+
+```bash
 curl -fsSL https://raw.githubusercontent.com/hrushikeshkuwlekar/layerops/main/layerops \
   -o /usr/local/bin/layerops
 chmod +x /usr/local/bin/layerops
@@ -63,6 +73,9 @@ ln -s "$PWD/layerops/layerops" /usr/local/bin/layerops
 ## Quick Start
 
 ```bash
+# Check all dependencies are installed
+layerops --doctor
+
 # Scan a single image
 layerops --image nginx:1.30.3
 
@@ -111,6 +124,9 @@ Patch (Copacetic):
       --patch-timeout <d> Per-image copa timeout, both passes (default: 15m)
   -qc, --copa-quiet       Hide copa BuildKit output (shown on failure)
   -Qc, --copa-verbose     Show copa output even under --quiet
+
+  -V, --version           Print version and exit
+      --doctor            Check that all dependencies are installed and report versions
 
   -h, --help              This help
 ```

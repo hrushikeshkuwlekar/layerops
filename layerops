@@ -31,7 +31,7 @@
 set -euo pipefail
 
 PROG="${0##*/}"
-VERSION="v4"
+VERSION="v4.0.0"
 IMAGES=()
 LIST=""
 FROM_JSON=""
@@ -105,6 +105,9 @@ Patch (Copacetic):
                           the captured output is still shown. Implied by --quiet.
   -Qc, --copa-verbose     Show copa's output even under --quiet.
 
+  -V, --version           Print version and exit
+      --doctor            Check that all dependencies are installed and report versions
+
   -h, --help              This help
 
 Notes:
@@ -136,6 +139,71 @@ EOF
 die()  { printf '%s: %s\n' "$PROG" "$*" >&2; exit 2; }
 warn() { printf '%s: %s\n' "$PROG" "$*" >&2; }
 
+# ------------------------------------------------------------------ doctor ---
+doctor() {
+  local has_color=0
+  [[ -t 1 ]] && has_color=1
+  local G='' R='' Y='' D='' B='' RST=''
+  if [[ $has_color -eq 1 ]]; then
+    G='\033[0;32m' R='\033[0;31m' Y='\033[0;33m' D='\033[2m' B='\033[1m' RST='\033[0m'
+  fi
+
+  printf "${B}layerops %s${RST}\n" "$VERSION"
+  printf "\n"
+
+  # jq
+  if command -v jq >/dev/null 2>&1; then
+    printf "  ${G}✅${RST} jq:        %s\n" "$(jq --version 2>/dev/null)"
+  else
+    printf "  ${R}❌${RST} jq:        not installed\n"
+  fi
+
+  # trivy
+  if command -v trivy >/dev/null 2>&1; then
+    local tv
+    tv="$(trivy version --format json 2>/dev/null | jq -r '.Version // empty' 2>/dev/null || trivy --version 2>/dev/null | head -1 || echo 'unknown')"
+    printf "  ${G}✅${RST} trivy:     %s\n" "$tv"
+  else
+    printf "  ${R}❌${RST} trivy:     not installed\n"
+  fi
+
+  # copa
+  if command -v copa >/dev/null 2>&1; then
+    printf "  ${G}✅${RST} copa:      %s\n" "$(copa --version 2>/dev/null || echo 'unknown')"
+  else
+    printf "  ${R}❌${RST} copa:      not installed ${D}(only needed for --patch)${RST}\n"
+  fi
+
+  # docker
+  if command -v docker >/dev/null 2>&1; then
+    local dv
+    dv="$(docker --version 2>/dev/null || echo 'unknown')"
+    if docker info >/dev/null 2>&1; then
+      printf "  ${G}✅${RST} docker:    %s\n" "$dv"
+    else
+      printf "  ${Y}⚠️${RST}  docker:    %s ${Y}(daemon not running)${RST}\n" "$dv"
+    fi
+  else
+    printf "  ${R}❌${RST} docker:    not installed ${D}(only needed for --patch)${RST}\n"
+  fi
+
+  # buildkitd container
+  if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+    local bk_state
+    bk_state="$(docker inspect --format '{{.State.Status}}' buildkitd 2>/dev/null || echo 'not_found')"
+    case "$bk_state" in
+      running) printf "  ${G}✅${RST} buildkit:  container running\n" ;;
+      *)       printf "  ${Y}⚠️${RST}  buildkit:  container %s ${D}(docker run -d --name buildkitd --privileged moby/buildkit)${RST}\n" "$bk_state" ;;
+    esac
+  else
+    printf "  ${D}—${RST}  buildkit:  ${D}requires docker${RST}\n"
+  fi
+
+  printf "\n"
+  printf "  ${D}Install everything: curl -sSL https://raw.githubusercontent.com/hrushikeshkuwlekar/layerops/main/scripts/install.sh | bash${RST}\n"
+  exit 0
+}
+
 # ---------------------------------------------------------------- arguments --
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -158,6 +226,8 @@ while [[ $# -gt 0 ]]; do
     --patch-timeout)  [[ $# -ge 2 ]] || die "$1 needs a value"; PATCH_TIMEOUT="$2";shift 2 ;;
     -qc|--copa-quiet)   COPA_QUIET=1; shift ;;
     -Qc|--copa-verbose) COPA_QUIET=0; shift ;;
+    -V|--version)    printf '%s %s\n' "$PROG" "$VERSION"; exit 0 ;;
+    --doctor)        doctor ;;
     -h|--help)       usage; exit 0 ;;
     -*)              die "unknown option: $1 (try --help)" ;;
     *)               IMAGES+=("$1"); shift ;;

@@ -133,7 +133,9 @@ parse_args() {
     esac
   done
 
-  [[ $SKIP_DEPS -eq 1 && $DEPS_ONLY -eq 1 ]] && die "--skip-deps and --deps-only are mutually exclusive"
+  if [[ $SKIP_DEPS -eq 1 && $DEPS_ONLY -eq 1 ]]; then
+    die "--skip-deps and --deps-only are mutually exclusive"
+  fi
 }
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -210,6 +212,15 @@ maybe_sudo() {
   fi
 }
 
+# Utility: run brew safely (Homebrew refuses to run directly as root)
+brew_cmd() {
+  if [[ $EUID -eq 0 ]] && [[ -n "${SUDO_USER:-}" ]]; then
+    sudo -u "$SUDO_USER" brew "$@"
+  else
+    brew "$@"
+  fi
+}
+
 # Utility: check a command exists
 has_cmd() { command -v "$1" >/dev/null 2>&1; }
 
@@ -240,7 +251,7 @@ install_jq() {
 
   substep "Installing jq..."
   case "$PKG_MGR" in
-    brew) brew install jq ;;
+    brew) brew_cmd install jq ;;
     apt)  maybe_sudo apt-get update -qq && maybe_sudo apt-get install -y -qq jq ;;
     dnf)  maybe_sudo dnf install -y -q jq ;;
     yum)  maybe_sudo yum install -y -q jq ;;
@@ -250,10 +261,10 @@ install_jq() {
       substep "Downloading jq binary from GitHub..."
       local jq_os jq_arch
       jq_os="$OS"
-      [[ "$OS" == "darwin" ]] && jq_os="macos"
+      if [[ "$OS" == "darwin" ]]; then jq_os="macos"; fi
       jq_arch="$ARCH"
-      [[ "$ARCH" == "amd64" ]] && jq_arch="amd64"
-      [[ "$ARCH" == "arm64" ]] && jq_arch="arm64"
+      if [[ "$ARCH" == "amd64" ]]; then jq_arch="amd64"; fi
+      if [[ "$ARCH" == "arm64" ]]; then jq_arch="arm64"; fi
       local jq_url="https://github.com/jqlang/jq/releases/latest/download/jq-${jq_os}-${jq_arch}"
       local tmp_jq
       tmp_jq="$(mktemp)"
@@ -287,7 +298,7 @@ install_trivy() {
 
   substep "Installing Trivy..."
   case "$PKG_MGR" in
-    brew) brew install trivy ;;
+    brew) brew_cmd install trivy ;;
     apt)
       # Official Trivy install via apt repository
       maybe_sudo apt-get update -qq
@@ -338,7 +349,7 @@ install_copa() {
 
   substep "Installing copa..."
   case "$PKG_MGR" in
-    brew) brew install copa ;;
+    brew) brew_cmd install copa ;;
     *)
       # Download copa binary from GitHub releases
       substep "Downloading copa from GitHub releases..."
@@ -346,7 +357,9 @@ install_copa() {
       # Get latest copa release version
       copa_version="$(curl -fsSL "https://api.github.com/repos/project-copacetic/copacetic/releases/latest" \
         | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": *"//;s/".*//')"
-      [[ -z "$copa_version" ]] && die "Could not determine latest copa version"
+      if [[ -z "$copa_version" ]]; then
+        die "Could not determine latest copa version"
+      fi
 
       local copa_ver_num="${copa_version#v}"
       local copa_os copa_arch
@@ -392,7 +405,7 @@ install_docker() {
     darwin)
       if [[ "$PKG_MGR" == "brew" ]]; then
         substep "Installing Docker Desktop via Homebrew Cask..."
-        brew install --cask docker
+        brew_cmd install --cask docker
         info "Docker Desktop installed. Please launch it from Applications to start the daemon."
         info "Waiting for Docker Desktop to initialise..."
         # Open Docker.app to start the daemon
@@ -564,14 +577,30 @@ install_layerops() {
   chmod +x "$tmp_script"
 
   # Install to target directory
+  local installed=0
   if [[ -w "$INSTALL_DIR" ]]; then
-    mv "$tmp_script" "$target"
-  else
-    maybe_sudo install -m 755 "$tmp_script" "$target"
+    if mv "$tmp_script" "$target" 2>/dev/null; then
+      chmod 755 "$target"
+      installed=1
+    fi
+  fi
+
+  if [[ $installed -eq 0 ]]; then
+    substep "Installing to ${target} (requires sudo)..."
+    if maybe_sudo install -m 755 "$tmp_script" "$target"; then
+      installed=1
+    fi
     rm -f "$tmp_script"
   fi
 
-  ok "Installed: layerops ${LAYEROPS_VERSION} → ${target}"
+  if [[ $installed -eq 1 ]] && [[ -x "$target" ]]; then
+    ok "Installed: layerops ${LAYEROPS_VERSION} → ${target}"
+    return 0
+  else
+    fail "Failed to install layerops to ${target}"
+    info "Tip: Run with --install-dir ~/.local/bin to install without sudo"
+    return 1
+  fi
 }
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

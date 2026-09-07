@@ -54,6 +54,16 @@ curl -sSL https://raw.githubusercontent.com/hrushikeshkuwlekar/layerops/main/scr
 
 The installer auto-detects your OS and architecture, skips tools already installed, and sets up the BuildKit container for patching.
 
+### Cross-Platform & Linux Compatibility
+
+Tested and verified on **macOS** (Apple Silicon & Intel) and **Linux** (Ubuntu/Debian, Alpine, Fedora/RHEL):
+- **Auto-Directory Creation** — Automatically creates `$INSTALL_DIR` (default: `/usr/local/bin`) if missing on clean or minimal systems.
+- **Multi-Arch Binary Fallbacks:**
+  - **Copacetic (`copa`)** — Dynamic OS/arch resolution (`linux/amd64`, `linux/arm64`, `darwin/arm64`, `darwin/amd64`).
+  - **Trivy** — Package manager install (`apt`/`dnf`/`yum`) with automatic fallback to Aqua Security's official installer.
+  - **jq** — Native package manager install with direct binary fallback from GitHub releases.
+- **Container & CI-Friendly** — Detects systemctl, service, and containerized environments gracefully without crashing.
+
 **Or install layerops only** (if you already have the dependencies):
 
 ```bash

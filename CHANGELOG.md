@@ -35,6 +35,16 @@ remediation tool that unifies Trivy scanning and Copacetic patching into a singl
 - **Distroless / scratch** images correctly labelled
 - **Multi-arch** tag normalisation for Docker Hub library images
 
+### Linux & Cross-Platform Enhancements
+
+- **Auto-Directory Creation** — Ensures `$INSTALL_DIR` (e.g. `/usr/local/bin`) is created via `mkdir -p` even on minimal or fresh Linux systems
+- **Multi-Arch Binary Fallbacks:**
+  - **Copacetic (`copa`)** — Dynamic OS/arch detection (`linux/amd64`, `linux/arm64`, `darwin/arm64`, `darwin/amd64`)
+  - **Trivy** — Package manager install with automated fallback to Aqua Security's official installer script if repository keys or network fail
+  - **jq** — Native package manager install (`apt`, `dnf`, `yum`, `apk`, `brew`) with direct binary fallback from GitHub releases
+- **Container-Aware Service Management** — Supports `systemctl`, `service`, and handles containerized environments gracefully without crashing if a systemd daemon is not present
+- **Verified Distros** — Tested and verified on Ubuntu (Debian), Alpine Linux (musl), Fedora (RPM), and macOS (Apple Silicon & Intel)
+
 ### Install
 
 ```bash

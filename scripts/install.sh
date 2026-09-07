@@ -326,6 +326,11 @@ REPO
       ;;
   esac
 
+  if ! has_cmd trivy; then
+    substep "Trying official Trivy install script fallback..."
+    curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b "${INSTALL_DIR}" || true
+  fi
+
   if has_cmd trivy; then
     ok "Installed: $(trivy --version 2>/dev/null | head -1)"
   else
@@ -363,7 +368,7 @@ install_copa() {
 
       local copa_ver_num="${copa_version#v}"
       local copa_os copa_arch
-      copa_os="linux"
+      copa_os="$OS"
       copa_arch="$ARCH"
 
       copa_url="https://github.com/project-copacetic/copacetic/releases/download/${copa_version}/copa_${copa_ver_num}_${copa_os}_${copa_arch}.tar.gz"
@@ -575,6 +580,9 @@ install_layerops() {
   fi
 
   chmod +x "$tmp_script"
+
+  # Ensure target directory exists
+  maybe_sudo mkdir -p "$INSTALL_DIR" 2>/dev/null || true
 
   # Install to target directory
   local installed=0

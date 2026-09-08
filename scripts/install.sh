@@ -26,20 +26,25 @@ SKIP_DEPS=0
 DEPS_ONLY=0
 UNINSTALL=0
 YES_MODE=0
+VERBOSE=0
+
+# Installation log file
+INSTALL_LOG="${INSTALL_LOG:-$(mktemp -t layerops-install-XXXXXX.log 2>/dev/null || mktemp /tmp/layerops-install-XXXXXX.log 2>/dev/null || echo "/tmp/layerops-install-${UID:-0}.log")}"
+touch "$INSTALL_LOG" 2>/dev/null || true
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Colors & Output Helpers
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 if [[ -t 1 ]] && [[ -z "${NO_COLOR:-}" ]]; then
-  RST='\033[0m'
-  BOLD='\033[1m'
-  DIM='\033[2m'
-  RED='\033[0;31m'
-  GREEN='\033[0;32m'
-  YELLOW='\033[0;33m'
-  BLUE='\033[0;34m'
-  CYAN='\033[0;36m'
-  WHITE='\033[1;37m'
+  RST=$'\033[0m'
+  BOLD=$'\033[1m'
+  DIM=$'\033[2m'
+  RED=$'\033[0;31m'
+  GREEN=$'\033[0;32m'
+  YELLOW=$'\033[0;33m'
+  BLUE=$'\033[0;34m'
+  CYAN=$'\033[0;36m'
+  WHITE=$'\033[1;37m'
 else
   RST='' BOLD='' DIM='' RED='' GREEN='' YELLOW='' BLUE='' CYAN='' WHITE=''
 fi
@@ -51,6 +56,15 @@ fail()    { printf "${RED}  ❌${RST} %s\n" "$*" >&2; }
 step()    { printf "\n${BOLD}${CYAN}▸ %s${RST}\n" "$*"; }
 substep() { printf "${DIM}  · %s${RST}\n" "$*"; }
 die()     { fail "$*"; exit 1; }
+
+# Command runner: silent by default (redirects to INSTALL_LOG), verbose with -v
+run_cmd() {
+  if [[ "$VERBOSE" -eq 1 ]]; then
+    "$@" 2>&1 | tee -a "$INSTALL_LOG"
+  else
+    "$@" >> "$INSTALL_LOG" 2>&1
+  fi
+}
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Banner
@@ -67,11 +81,11 @@ banner() {
    │   ██║     ██╔══██║  ╚██╔╝  ██╔══╝  ██╔══██╗     │
    │   ███████╗██║  ██║   ██║   ███████╗██║  ██║     │
    │   ╚══════╝╚═╝  ╚═╝   ╚═╝   ╚══════╝╚═╝  ╚═╝     │
-   │                  ╔═╗ ╔═╗ ╔═╗                     │
-   │                  ║ ║ ╠═╝ ╚═╗                     │
-   │                  ╚═╝ ╩   ╚═╝                     │
+   │                   ╔═╗ ╔═╗ ╔═╗                   │
+   │                   ║ ║ ╠═╝ ╚═╗                   │
+   │                   ╚═╝ ╩   ╚═╝                   │
    │                                                 │
-   │            layerops — unified installer          │
+   │          layerops — unified installer           │
    │                                                 │
    └─────────────────────────────────────────────────┘
 EOF
@@ -93,6 +107,7 @@ Options:
   --uninstall       Remove layerops from $INSTALL_DIR (deps are left intact)
   --install-dir <d> Install directory (default: $INSTALL_DIR)
   --version <v>     layerops version to install (default: $LAYEROPS_VERSION)
+  -v, --verbose     Show verbose installation output (default: silent)
   -y, --yes         Non-interactive mode — assume yes to all prompts
   -h, --help        Show this help
 
@@ -127,6 +142,7 @@ parse_args() {
       --uninstall)    UNINSTALL=1; shift ;;
       --install-dir)  [[ $# -ge 2 ]] || die "--install-dir requires a value"; INSTALL_DIR="$2"; shift 2 ;;
       --version)      [[ $# -ge 2 ]] || die "--version requires a value"; LAYEROPS_VERSION="$2"; shift 2 ;;
+      -v|--verbose)   VERBOSE=1; shift ;;
       -y|--yes)       YES_MODE=1; shift ;;
       -h|--help)      usage; exit 0 ;;
       *)              die "Unknown option: $1 (try --help)" ;;
@@ -200,8 +216,17 @@ detect_pkg_manager() {
 }
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# Utility: run a command with sudo if needed
+# Privilege & Command Helpers
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ensure_sudo() {
+  if [[ "$OS" == "linux" ]] && [[ $EUID -ne 0 ]] && command -v sudo >/dev/null 2>&1; then
+    if ! sudo -n true 2>/dev/null; then
+      substep "Administrative privileges required (sudo)..."
+      sudo -v || die "Sudo authorization failed"
+    fi
+  fi
+}
+
 maybe_sudo() {
   if [[ $EUID -eq 0 ]]; then
     "$@"
@@ -251,11 +276,16 @@ install_jq() {
 
   substep "Installing jq..."
   case "$PKG_MGR" in
-    brew) brew_cmd install jq ;;
-    apt)  maybe_sudo apt-get update -qq && maybe_sudo apt-get install -y -qq jq ;;
-    dnf)  maybe_sudo dnf install -y -q jq ;;
-    yum)  maybe_sudo yum install -y -q jq ;;
-    apk)  maybe_sudo apk add --no-cache jq ;;
+    brew)
+      HOMEBREW_NO_AUTO_UPDATE=1 run_cmd brew_cmd install -q jq
+      ;;
+    apt)
+      run_cmd maybe_sudo env DEBIAN_FRONTEND=noninteractive apt-get update -qq || true
+      run_cmd maybe_sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq -o Dpkg::Use-Pty=0 jq
+      ;;
+    dnf)  run_cmd maybe_sudo dnf install -y -q jq ;;
+    yum)  run_cmd maybe_sudo yum install -y -q jq ;;
+    apk)  run_cmd maybe_sudo apk add --no-cache -q jq ;;
     *)
       # Direct binary download as fallback
       substep "Downloading jq binary from GitHub..."
@@ -270,7 +300,7 @@ install_jq() {
       tmp_jq="$(mktemp)"
       download "$jq_url" "$tmp_jq"
       chmod +x "$tmp_jq"
-      maybe_sudo install -m 755 "$tmp_jq" "${INSTALL_DIR}/jq"
+      run_cmd maybe_sudo install -m 755 "$tmp_jq" "${INSTALL_DIR}/jq"
       rm -f "$tmp_jq"
       ;;
   esac
@@ -278,7 +308,7 @@ install_jq() {
   if has_cmd jq; then
     ok "Installed: $(jq --version 2>/dev/null)"
   else
-    fail "jq installation failed"
+    fail "jq installation failed (see log: ${INSTALL_LOG})"
     return 1
   fi
 }
@@ -298,43 +328,58 @@ install_trivy() {
 
   substep "Installing Trivy..."
   case "$PKG_MGR" in
-    brew) brew_cmd install trivy ;;
+    brew)
+      HOMEBREW_NO_AUTO_UPDATE=1 run_cmd brew_cmd install -q trivy
+      ;;
     apt)
       # Official Trivy install via apt repository
-      maybe_sudo apt-get update -qq
-      maybe_sudo apt-get install -y -qq wget apt-transport-https gnupg
-      wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | maybe_sudo gpg --dearmor -o /usr/share/keyrings/trivy.gpg 2>/dev/null
-      echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] https://aquasecurity.github.io/trivy-repo/deb generic main" | maybe_sudo tee /etc/apt/sources.list.d/trivy.list >/dev/null
-      maybe_sudo apt-get update -qq
-      maybe_sudo apt-get install -y -qq trivy
+      run_cmd maybe_sudo env DEBIAN_FRONTEND=noninteractive apt-get update -qq || true
+      run_cmd maybe_sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq -o Dpkg::Use-Pty=0 wget apt-transport-https gnupg
+      if [[ "$VERBOSE" -eq 1 ]]; then
+        wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | maybe_sudo gpg --dearmor --yes -o /usr/share/keyrings/trivy.gpg 2>&1 | tee -a "$INSTALL_LOG"
+        echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] https://aquasecurity.github.io/trivy-repo/deb generic main" | maybe_sudo tee /etc/apt/sources.list.d/trivy.list | tee -a "$INSTALL_LOG"
+      else
+        wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | maybe_sudo gpg --dearmor --yes -o /usr/share/keyrings/trivy.gpg >> "$INSTALL_LOG" 2>&1
+        echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] https://aquasecurity.github.io/trivy-repo/deb generic main" | maybe_sudo tee /etc/apt/sources.list.d/trivy.list >> "$INSTALL_LOG" 2>&1
+      fi
+      run_cmd maybe_sudo env DEBIAN_FRONTEND=noninteractive apt-get update -qq || true
+      run_cmd maybe_sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq -o Dpkg::Use-Pty=0 trivy
       ;;
     dnf|yum)
       # Official Trivy RPM repository
-      cat <<'REPO' | maybe_sudo tee /etc/yum.repos.d/trivy.repo >/dev/null
+      cat <<'REPO' | maybe_sudo tee /etc/yum.repos.d/trivy.repo >> "$INSTALL_LOG" 2>&1
 [trivy]
 name=Trivy repository
 baseurl=https://aquasecurity.github.io/trivy-repo/rpm/releases/$basearch/
 gpgcheck=0
 enabled=1
 REPO
-      maybe_sudo "${PKG_MGR}" install -y -q trivy
+      run_cmd maybe_sudo "${PKG_MGR}" install -y -q trivy
       ;;
     *)
       # Fallback: official install script
       substep "Using official Trivy install script..."
-      curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b "${INSTALL_DIR}"
+      if [[ "$VERBOSE" -eq 1 ]]; then
+        curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b "${INSTALL_DIR}" 2>&1 | tee -a "$INSTALL_LOG"
+      else
+        curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b "${INSTALL_DIR}" >> "$INSTALL_LOG" 2>&1
+      fi
       ;;
   esac
 
   if ! has_cmd trivy; then
     substep "Trying official Trivy install script fallback..."
-    curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b "${INSTALL_DIR}" || true
+    if [[ "$VERBOSE" -eq 1 ]]; then
+      curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b "${INSTALL_DIR}" 2>&1 | tee -a "$INSTALL_LOG" || true
+    else
+      curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b "${INSTALL_DIR}" >> "$INSTALL_LOG" 2>&1 || true
+    fi
   fi
 
   if has_cmd trivy; then
     ok "Installed: $(trivy --version 2>/dev/null | head -1)"
   else
-    fail "Trivy installation failed"
+    fail "Trivy installation failed (see log: ${INSTALL_LOG})"
     return 1
   fi
 }
@@ -354,7 +399,9 @@ install_copa() {
 
   substep "Installing copa..."
   case "$PKG_MGR" in
-    brew) brew_cmd install copa ;;
+    brew)
+      HOMEBREW_NO_AUTO_UPDATE=1 run_cmd brew_cmd install -q copa
+      ;;
     *)
       # Download copa binary from GitHub releases
       substep "Downloading copa from GitHub releases..."
@@ -377,8 +424,8 @@ install_copa() {
       trap "rm -rf '$tmp_dir'" RETURN
 
       download "$copa_url" "${tmp_dir}/copa.tar.gz"
-      tar -xzf "${tmp_dir}/copa.tar.gz" -C "$tmp_dir"
-      maybe_sudo install -m 755 "${tmp_dir}/copa" "${INSTALL_DIR}/copa"
+      run_cmd tar -xzf "${tmp_dir}/copa.tar.gz" -C "$tmp_dir"
+      run_cmd maybe_sudo install -m 755 "${tmp_dir}/copa" "${INSTALL_DIR}/copa"
       rm -rf "$tmp_dir"
       trap - RETURN
       ;;
@@ -387,7 +434,7 @@ install_copa() {
   if has_cmd copa; then
     ok "Installed: $(copa --version 2>/dev/null)"
   else
-    fail "copa installation failed"
+    fail "copa installation failed (see log: ${INSTALL_LOG})"
     return 1
   fi
 }
@@ -410,7 +457,7 @@ install_docker() {
     darwin)
       if [[ "$PKG_MGR" == "brew" ]]; then
         substep "Installing Docker Desktop via Homebrew Cask..."
-        brew_cmd install --cask docker
+        HOMEBREW_NO_AUTO_UPDATE=1 run_cmd brew_cmd install -q --cask docker
         info "Docker Desktop installed. Please launch it from Applications to start the daemon."
         info "Waiting for Docker Desktop to initialise..."
         # Open Docker.app to start the daemon
@@ -421,15 +468,19 @@ install_docker() {
       ;;
     linux)
       substep "Installing Docker Engine via get.docker.com..."
-      curl -fsSL https://get.docker.com | maybe_sudo sh
+      if [[ "$VERBOSE" -eq 1 ]]; then
+        curl -fsSL https://get.docker.com | maybe_sudo sh 2>&1 | tee -a "$INSTALL_LOG"
+      else
+        curl -fsSL https://get.docker.com | maybe_sudo sh >> "$INSTALL_LOG" 2>&1
+      fi
       # Start and enable Docker
       if has_cmd systemctl; then
-        maybe_sudo systemctl start docker 2>/dev/null || true
-        maybe_sudo systemctl enable docker 2>/dev/null || true
+        run_cmd maybe_sudo systemctl start docker
+        run_cmd maybe_sudo systemctl enable docker
       fi
       # Add current user to docker group (avoids needing sudo for docker commands)
       if [[ $EUID -ne 0 ]] && has_cmd usermod; then
-        maybe_sudo usermod -aG docker "$USER" 2>/dev/null || true
+        run_cmd maybe_sudo usermod -aG docker "$USER"
         warn "Added $USER to docker group. You may need to log out and back in for this to take effect."
       fi
       ;;
@@ -438,7 +489,7 @@ install_docker() {
   if has_cmd docker; then
     ok "Installed: $(docker --version 2>/dev/null)"
   else
-    fail "Docker installation failed"
+    fail "Docker installation failed (see log: ${INSTALL_LOG})"
     return 1
   fi
 }
@@ -511,30 +562,30 @@ setup_buildkit() {
       ;;
     exited|created|paused)
       substep "BuildKit container exists but is ${state} — starting it..."
-      docker start buildkitd >/dev/null 2>&1
+      run_cmd docker start buildkitd
       if docker inspect --format '{{.State.Status}}' buildkitd 2>/dev/null | grep -q "running"; then
         ok "BuildKit container 'buildkitd' started"
       else
-        fail "Could not start existing buildkitd container"
+        fail "Could not start existing buildkitd container (see log: ${INSTALL_LOG})"
         return 1
       fi
       ;;
     *)
       substep "Pulling moby/buildkit image..."
-      docker pull moby/buildkit >/dev/null 2>&1 || docker pull moby/buildkit
+      run_cmd docker pull moby/buildkit
 
       substep "Starting BuildKit container..."
-      docker run -d \
+      run_cmd docker run -d \
         --name buildkitd \
         --privileged \
-        moby/buildkit >/dev/null 2>&1
+        moby/buildkit
 
       # Verify it started
       sleep 2
       if docker inspect --format '{{.State.Status}}' buildkitd 2>/dev/null | grep -q "running"; then
         ok "BuildKit container 'buildkitd' is running"
       else
-        fail "BuildKit container failed to start"
+        fail "BuildKit container failed to start (see log: ${INSTALL_LOG})"
         return 1
       fi
       ;;
@@ -582,7 +633,9 @@ install_layerops() {
   chmod +x "$tmp_script"
 
   # Ensure target directory exists
-  maybe_sudo mkdir -p "$INSTALL_DIR" 2>/dev/null || true
+  if ! mkdir -p "$INSTALL_DIR" 2>/dev/null; then
+    run_cmd maybe_sudo mkdir -p "$INSTALL_DIR"
+  fi
 
   # Install to target directory
   local installed=0
@@ -595,7 +648,7 @@ install_layerops() {
 
   if [[ $installed -eq 0 ]]; then
     substep "Installing to ${target} (requires sudo)..."
-    if maybe_sudo install -m 755 "$tmp_script" "$target"; then
+    if run_cmd maybe_sudo install -m 755 "$tmp_script" "$target"; then
       installed=1
     fi
     rm -f "$tmp_script"
@@ -605,7 +658,7 @@ install_layerops() {
     ok "Installed: layerops ${LAYEROPS_VERSION} → ${target}"
     return 0
   else
-    fail "Failed to install layerops to ${target}"
+    fail "Failed to install layerops to ${target} (see log: ${INSTALL_LOG})"
     info "Tip: Run with --install-dir ~/.local/bin to install without sudo"
     return 1
   fi
@@ -626,7 +679,7 @@ do_uninstall() {
   if [[ -w "$target" ]]; then
     rm -f "$target"
   else
-    maybe_sudo rm -f "$target"
+    run_cmd maybe_sudo rm -f "$target"
   fi
 
   ok "Removed: ${target}"
@@ -738,7 +791,11 @@ print_summary() {
   printf "\n"
 
   if [[ ${#SUMMARY_FAILED[@]} -gt 0 ]]; then
-    printf "  ${YELLOW}Some components had issues. Run 'layerops --doctor' to diagnose.${RST}\n\n"
+    printf "  ${YELLOW}Some components had issues. Check the installation log:${RST}\n"
+    printf "    ${WHITE}%s${RST}\n" "$INSTALL_LOG"
+    printf "  ${YELLOW}Run 'layerops --doctor' to diagnose.${RST}\n\n"
+  else
+    printf "  ${DIM}Installation log: %s${RST}\n\n" "$INSTALL_LOG"
   fi
 
   printf "  ${DIM}Get started:${RST}\n"
@@ -774,6 +831,7 @@ main() {
   # Install dependencies
   if [[ $SKIP_DEPS -eq 0 ]]; then
     detect_pkg_manager
+    ensure_sudo
 
     # Each install function is fail-safe — a failure is tracked but doesn't
     # abort the script, so the user gets as much installed as possible.

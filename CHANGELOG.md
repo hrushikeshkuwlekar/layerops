@@ -42,6 +42,8 @@ remediation tool that unifies Trivy scanning and Copacetic patching into a singl
   - **Copacetic (`copa`)** — Dynamic OS/arch detection (`linux/amd64`, `linux/arm64`, `darwin/arm64`, `darwin/amd64`)
   - **Trivy** — Package manager install with automated fallback to Aqua Security's official installer script if repository keys or network fail
   - **jq** — Native package manager install (`apt`, `dnf`, `yum`, `apk`, `brew`) with direct binary fallback from GitHub releases
+- **Silent Installation & Clean Logging** — Suppresses noisy debconf and dpkg unpack output during installations, capturing background details to an installation log while showing clean progress checkmarks
+- **Perfect Rectangle Banner Alignment** — Balanced Unicode box-drawing characters for seamless monospace rectangle rendering
 - **Container-Aware Service Management** — Supports `systemctl`, `service`, and handles containerized environments gracefully without crashing if a systemd daemon is not present
 - **Verified Distros** — Tested and verified on Ubuntu (Debian), Alpine Linux (musl), Fedora (RPM), and macOS (Apple Silicon & Intel)
 

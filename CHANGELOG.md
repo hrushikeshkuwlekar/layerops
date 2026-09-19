@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [v4.1.0] — 2026-09-19
+
+### Changed
+
+- **Single-line patch progress** — Each image now prints one progressively-updated
+  status line during patching instead of up to 20 lines of verbose retry messages
+  and copa output dumps. Terminal-aware: uses `\r` overwrite on TTYs, space-separated
+  tokens in pipes/CI. Failed images show `FAILED` on the same line and details remain
+  in the summary table. Copa output is only shown with `--copa-verbose` / `-Qc`.
+
+### Added
+
+- **`--cu` flag (comprehensive update)** — When combined with `--patch`, skips the
+  report-based first pass and patches every image directly with
+  `copa --ignore-errors` (comprehensive + host-arch-pinned). Useful when report-based
+  patching is known to fail for most images (e.g. Oracle images, epoch mismatches).
+  Requires `--patch`; dies early if used alone.
+
+---
+
 ## [v4.0.0] — 2026-09-07
 
 ### 🎉 First Official Release
@@ -53,4 +73,5 @@ remediation tool that unifies Trivy scanning and Copacetic patching into a singl
 curl -sSL https://raw.githubusercontent.com/hrushikeshkuwlekar/layerops/main/scripts/install.sh | bash
 ```
 
+[v4.1.0]: https://github.com/hrushikeshkuwlekar/layerops/releases/tag/v4.1.0
 [v4.0.0]: https://github.com/hrushikeshkuwlekar/layerops/releases/tag/v4.0.0

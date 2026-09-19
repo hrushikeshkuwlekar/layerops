@@ -23,6 +23,8 @@
 #                                      Pinned to the host's native CPU architecture
 #                                      to avoid QEMU emulation timeouts on multi-
 #                                      arch images.
+#           With --cu, the report-based first pass is skipped entirely and every
+#           image goes straight through comprehensive + --ignore-errors.
 #
 # Assess:        layerops --list images.txt --csv report.csv
 # Assess + fix:  layerops --list images.txt --patch --verify
@@ -31,7 +33,7 @@
 set -euo pipefail
 
 PROG="${0##*/}"
-VERSION="v4.0.0"
+VERSION="v4.1.0"
 IMAGES=()
 LIST=""
 FROM_JSON=""
@@ -46,6 +48,7 @@ FAIL_ON_FIXABLE=0
 QUIET=0
 
 PATCH=0
+COMPREHENSIVE_UPDATE=0
 PATCH_SUFFIX="lo-delta"
 VERIFY=0
 COPA_ADDR=""
@@ -92,6 +95,10 @@ Patch (Copacetic):
                                      package failures such as epoch version mismatches.
                                      Pinned to the host's native CPU arch to avoid
                                      QEMU timeouts on multi-arch images.
+      --cu                Skip the report-based first pass and patch all images with
+                          copa --ignore-errors (comprehensive update). Useful when
+                          report-based patching is known to fail (e.g. Oracle images,
+                          epoch mismatches). Requires --patch.
       --patch-suffix <s>  Tag suffix for patched images       (default: $PATCH_SUFFIX)
                           nginx:1.30.3 -> nginx:1.30.3-$PATCH_SUFFIX
       --verify            Re-scan each patched image and report before -> after.
@@ -133,6 +140,7 @@ Examples:
   $PROG --list images.txt --html report.html --csv report.csv
   $PROG --image nginx:1.30.3 --patch --patch-suffix hotfix
   $PROG --list images.txt --patch --verify --patch-timeout 30m
+  $PROG --list images.txt --patch --cu --verify
 EOF
 }
 
@@ -220,6 +228,7 @@ while [[ $# -gt 0 ]]; do
     -q|--quiet)      QUIET=1; shift ;;
     --fail-on-fixable) FAIL_ON_FIXABLE=1; shift ;;
     --patch)         PATCH=1; shift ;;
+    --cu)            COMPREHENSIVE_UPDATE=1; shift ;;
     --patch-suffix)  [[ $# -ge 2 ]] || die "$1 needs a value"; PATCH_SUFFIX="$2";shift 2 ;;
     --verify)        VERIFY=1; shift ;;
     --copa-addr)     [[ $# -ge 2 ]] || die "$1 needs a value"; COPA_ADDR="$2";   shift 2 ;;
@@ -253,6 +262,7 @@ if [[ $PATCH -eq 1 ]]; then
   fi
 fi
 [[ $VERIFY -eq 1 && $PATCH -eq 0 ]] && warn "--verify has no effect without --patch"
+[[ $COMPREHENSIVE_UPDATE -eq 1 && $PATCH -eq 0 ]] && die "--cu requires --patch"
 
 # copa output follows --quiet unless explicitly overridden
 [[ $COPA_QUIET -eq -1 ]] && COPA_QUIET=$QUIET
@@ -467,6 +477,26 @@ PATCH_FAILED_IMGS=()
 if [[ $PATCH -eq 1 ]]; then
   echo "=== patch — copa (os-pkgs only) ==="
 
+  # --- progress helpers: single-line status per image ---
+  _patch_is_tty=0; [[ -t 2 ]] && _patch_is_tty=1
+  _patch_line=""   # current progress line content
+  # Start a new single-line progress (overwrites previous line if TTY)
+  pstart() { _patch_line="$*"; printf '\r%s' "$_patch_line" >&2; }
+  # Append a status token to the current line
+  pappend() {
+    _patch_line="${_patch_line} ... $*"
+    if [[ $_patch_is_tty -eq 1 ]]; then
+      printf '\r\033[2K%s' "$_patch_line" >&2
+    else
+      printf ' ... %s' "$*" >&2
+    fi
+  }
+  # Finish the current progress line with a newline
+  pend() {
+    if [[ $# -gt 0 ]]; then pappend "$*"; fi
+    printf '\n' >&2
+  }
+
   ptotal=${#JSONS[@]}
   pn=0
   for i in "${!JSONS[@]}"; do
@@ -488,11 +518,7 @@ if [[ $PATCH -eq 1 ]]; then
     rep="$WORKDIR/copa-$(printf '%s' "$img" | tr '/:@ ' '____').json"
     copa_report "$src" "$rep"
 
-    cargs=(patch -i "$img" -r "$rep" -t "$(patched_tag "$img")")
-    [[ -n "$COPA_ADDR" ]] && cargs+=(-a "$COPA_ADDR")
-    cargs+=(--timeout "${PATCH_TIMEOUT:-15m}")
-
-    printf '%s: [%d/%d] patching %s -> %s\n' "$PROG" "$pn" "$ptotal" "$img" "$newref" >&2
+    pstart "$(printf '%s: [%d/%d] patching %s' "$PROG" "$pn" "$ptotal" "$img")"
 
     # copa is loud: BuildKit progress bars plus every apt line. When quiet, capture
     # it and replay only on failure — silence when it works, diagnostics when it doesn't.
@@ -503,36 +529,9 @@ if [[ $PATCH -eq 1 ]]; then
       copa_run() { copa "$@" >&2; }
     fi
 
-    # an image that fails to patch must not take the batch down with it
-    # Strategy: first try with the Trivy report (-r), which is precise.
-    # If that fails (e.g. version-comparison issues like libreoffice epoch
-    # mismatches), retry without -r but with --ignore-errors — copa then
-    # does a comprehensive update, skipping individual package failures.
-    copa_ok=0
-    if copa_run "${cargs[@]}"; then
-      # If docker daemon normalized the name (e.g. stripped docker.io/library/), alias to $newref
-      if ! docker image inspect "$newref" >/dev/null 2>&1; then
-        for cand in "${newref#docker.io/library/}" "${newref#docker.io/}"; do
-          if docker image inspect "$cand" >/dev/null 2>&1; then
-            docker tag "$cand" "$newref" >/dev/null 2>&1
-            break
-          fi
-        done
-      fi
-      copa_ok=1
-    else
-      warn "report-based patch failed for $img — retrying with --ignore-errors (no report)"
-      if [[ $COPA_QUIET -eq 1 && -s "$clog" ]]; then
-        printf '  --- copa output (last 15 lines) ---\n' >&2
-        tail -n 15 "$clog" | sed 's/^/  /' >&2
-        printf '  -----------------------------------\n' >&2
-      fi
-
-      # build retry args: same flags minus -r, plus --ignore-errors
-      # comprehensive updates are heavier — use a longer timeout (15m)
-      # unless the user explicitly set --patch-timeout.
-      # Pin to the host's native platform so multi-arch images don't
-      # waste time on QEMU-emulated foreign architectures.
+    # --- comprehensive-update helper (shared by --cu and fallback retry) ---
+    # Builds args for copa --ignore-errors, pinned to host arch.
+    run_comprehensive() {
       host_arch=""
       case "$(uname -m)" in
         x86_64|amd64)  host_arch="linux/amd64" ;;
@@ -540,46 +539,76 @@ if [[ $PATCH -eq 1 ]]; then
         armv7*)        host_arch="linux/arm/v7" ;;
         *)             host_arch="" ;;   # let copa decide
       esac
-      rargs=(patch -i "$img" -t "$(patched_tag "$img")" --ignore-errors)
+      local rargs=(patch -i "$img" -t "$(patched_tag "$img")" --ignore-errors)
       [[ -n "$COPA_ADDR" ]] && rargs+=(-a "$COPA_ADDR")
       [[ -n "$host_arch" ]] && rargs+=(--platform "$host_arch")
       rargs+=(--timeout "${PATCH_TIMEOUT:-15m}")
 
-      printf '%s: [%d/%d] retrying %s (comprehensive + --ignore-errors)\n' \
-        "$PROG" "$pn" "$ptotal" "$img" >&2
+      if ! copa_run "${rargs[@]}"; then
+        return 1
+      fi
 
-      if copa_run "${rargs[@]}"; then
-        # Copa with --platform appends an arch suffix (e.g. -arm64), and Docker
-        # daemon normalizes Docker Hub library images (stripping docker.io/library/).
-        # Check all candidate tags in Docker daemon and alias to $newref.
-        arch_suffix=""
-        case "$host_arch" in
-          linux/amd64)  arch_suffix="-amd64" ;;
-          linux/arm64)  arch_suffix="-arm64" ;;
-          linux/arm/v7) arch_suffix="-armv7" ;;
-        esac
-        found_img=""
-        candidates=(
-          "$newref"
-          "${newref}${arch_suffix}"
-          "${newref#docker.io/library/}"
-          "${newref#docker.io/library/}${arch_suffix}"
-          "${newref#docker.io/}"
-          "${newref#docker.io/}${arch_suffix}"
-        )
-        for cand in "${candidates[@]}"; do
-          if [[ -n "$cand" ]] && docker image inspect "$cand" >/dev/null 2>&1; then
-            found_img="$cand"
-            break
-          fi
-        done
-        if [[ -n "$found_img" ]]; then
-          if [[ "$found_img" != "$newref" ]]; then
-            docker tag "$found_img" "$newref" >/dev/null 2>&1
-          fi
+      # Copa with --platform may append an arch suffix (e.g. -arm64), and Docker
+      # daemon normalizes Docker Hub library images (stripping docker.io/library/).
+      # Check all candidate tags in Docker daemon and alias to $newref.
+      local arch_suffix=""
+      case "$host_arch" in
+        linux/amd64)  arch_suffix="-amd64" ;;
+        linux/arm64)  arch_suffix="-arm64" ;;
+        linux/arm/v7) arch_suffix="-armv7" ;;
+      esac
+      local found_img=""
+      local candidates=(
+        "$newref"
+        "${newref}${arch_suffix}"
+        "${newref#docker.io/library/}"
+        "${newref#docker.io/library/}${arch_suffix}"
+        "${newref#docker.io/}"
+        "${newref#docker.io/}${arch_suffix}"
+      )
+      for cand in "${candidates[@]}"; do
+        if [[ -n "$cand" ]] && docker image inspect "$cand" >/dev/null 2>&1; then
+          found_img="$cand"
+          break
+        fi
+      done
+      if [[ -n "$found_img" ]]; then
+        [[ "$found_img" != "$newref" ]] && docker tag "$found_img" "$newref" >/dev/null 2>&1
+        return 0
+      else
+        return 1
+      fi
+    }
+
+    # --- patch strategy ---
+    copa_ok=0
+    if [[ $COMPREHENSIVE_UPDATE -eq 1 ]]; then
+      # --cu: go straight to comprehensive + --ignore-errors
+      pappend "exhaustive processing"
+      if run_comprehensive; then
+        copa_ok=1
+      fi
+    else
+      # Two-pass: try report-based first, fallback to comprehensive
+      cargs=(patch -i "$img" -r "$rep" -t "$(patched_tag "$img")")
+      [[ -n "$COPA_ADDR" ]] && cargs+=(-a "$COPA_ADDR")
+      cargs+=(--timeout "${PATCH_TIMEOUT:-15m}")
+
+      if copa_run "${cargs[@]}"; then
+        # If docker daemon normalized the name (e.g. stripped docker.io/library/), alias to $newref
+        if ! docker image inspect "$newref" >/dev/null 2>&1; then
+          for cand in "${newref#docker.io/library/}" "${newref#docker.io/}"; do
+            if docker image inspect "$cand" >/dev/null 2>&1; then
+              docker tag "$cand" "$newref" >/dev/null 2>&1
+              break
+            fi
+          done
+        fi
+        copa_ok=1
+      else
+        pappend "exhaustive processing"
+        if run_comprehensive; then
           copa_ok=1
-        else
-          warn "retry exited 0 but patched image not found in docker: $newref"
         fi
       fi
     fi
@@ -589,30 +618,30 @@ if [[ $PATCH -eq 1 ]]; then
       after_total="-"; after_fix="-"; removed="-"
 
       if [[ $VERIFY -eq 1 ]]; then
+        pappend "verification in progress"
         vout="$WORKDIR/verify-$(printf '%s' "$newref" | tr '/:@ ' '____').json"
         vargs=(image --pkg-types os --scanners vuln --format json --output "$vout")
         [[ -n "$SEVERITIES" ]] && vargs+=(--severity "$SEVERITIES")
         [[ $QUIET -eq 1 ]] && vargs+=(--quiet)
         vargs+=("$newref")
 
-        printf '%s: [%d/%d] verifying %s\n' "$PROG" "$pn" "$ptotal" "$newref" >&2
         if trivy "${vargs[@]}" && jq -e . "$vout" >/dev/null 2>&1; then
           IFS=$'\t' read -r after_total after_fix _av <<<"$(counts_row os-pkgs "$vout")"
           removed=$(( os_total - after_total ))
         else
-          warn "patched but could not verify: $newref"
           after_total="ERR"; after_fix="ERR"; removed="-"
         fi
       fi
 
+      pend "$newref"
       PATCH_ROWS+=("$(printf '%s\t%s\t%s\t%s\tPATCHED\t%s\t%s' \
         "$img" "$newref" "$os_total" "$os_fix" "$after_total" "$removed")")
     else
+      pend "FAILED"
       PATCH_FAIL=$((PATCH_FAIL + 1))
       PATCH_FAILED_IMGS+=("$img")
-      warn "PATCH FAILED (continuing): $img"
-      # a suppressed failure is a silent failure — always show why
-      if [[ $COPA_QUIET -eq 1 && -s "$clog" ]]; then
+      # Show copa output only when explicitly asked via --copa-verbose
+      if [[ $COPA_QUIET -eq 0 && -s "$clog" ]]; then
         printf '  --- copa output (last 15 lines) ---\n' >&2
         tail -n 15 "$clog" | sed 's/^/  /' >&2
         printf '  -----------------------------------\n' >&2

@@ -17,7 +17,7 @@ set -euo pipefail
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Configuration
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-LAYEROPS_VERSION="${LAYEROPS_VERSION:-v4.0.0}"
+LAYEROPS_VERSION="${LAYEROPS_VERSION:-v4.1.0}"
 LAYEROPS_REPO="hrushikeshkuwlekar/layerops"
 INSTALL_DIR="${INSTALL_DIR:-/usr/local/bin}"
 
@@ -408,10 +408,12 @@ install_copa() {
       local copa_version copa_url tmp_dir
       # Get latest copa release version
       copa_version="$(curl -fsSL "https://api.github.com/repos/project-copacetic/copacetic/releases/latest" \
-        | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": *"//;s/".*//')"
+        | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": *"//;s/".*//')" || true
       if [[ -z "$copa_version" ]]; then
-        die "Could not determine latest copa version"
+        fail "Could not determine latest copa version from GitHub API"
+        return 1
       fi
+      substep "Latest copa version: ${copa_version}"
 
       local copa_ver_num="${copa_version#v}"
       local copa_os copa_arch
@@ -419,15 +421,48 @@ install_copa() {
       copa_arch="$ARCH"
 
       copa_url="https://github.com/project-copacetic/copacetic/releases/download/${copa_version}/copa_${copa_ver_num}_${copa_os}_${copa_arch}.tar.gz"
+      substep "Download URL: ${copa_url}"
 
       tmp_dir="$(mktemp -d)"
-      trap "rm -rf '$tmp_dir'" RETURN
 
-      download "$copa_url" "${tmp_dir}/copa.tar.gz"
-      run_cmd tar -xzf "${tmp_dir}/copa.tar.gz" -C "$tmp_dir"
-      run_cmd maybe_sudo install -m 755 "${tmp_dir}/copa" "${INSTALL_DIR}/copa"
-      rm -rf "$tmp_dir"
-      trap - RETURN
+      # Step 1: Download
+      if ! download "$copa_url" "${tmp_dir}/copa.tar.gz"; then
+        fail "Failed to download copa from ${copa_url}"
+        rm -rf "$tmp_dir" 2>/dev/null || true
+        return 1
+      fi
+
+      # Step 2: Extract
+      if ! tar -xzf "${tmp_dir}/copa.tar.gz" -C "$tmp_dir" >> "$INSTALL_LOG" 2>&1; then
+        fail "Failed to extract copa tarball"
+        rm -rf "$tmp_dir" 2>/dev/null || true
+        return 1
+      fi
+
+      # Step 3: Verify binary was extracted
+      if [[ ! -f "${tmp_dir}/copa" ]]; then
+        fail "copa binary not found in extracted tarball"
+        rm -rf "$tmp_dir" 2>/dev/null || true
+        return 1
+      fi
+
+      # Step 4: Ensure install directory exists
+      if [[ ! -d "$INSTALL_DIR" ]]; then
+        substep "Creating ${INSTALL_DIR}..."
+        if ! mkdir -p "$INSTALL_DIR" 2>/dev/null; then
+          maybe_sudo mkdir -p "$INSTALL_DIR" >> "$INSTALL_LOG" 2>&1 || true
+        fi
+      fi
+
+      # Step 5: Install binary
+      if ! maybe_sudo install -m 755 "${tmp_dir}/copa" "${INSTALL_DIR}/copa" >> "$INSTALL_LOG" 2>&1; then
+        fail "Failed to install copa binary to ${INSTALL_DIR}/copa"
+        rm -rf "$tmp_dir" 2>/dev/null || true
+        return 1
+      fi
+
+      # Clean up
+      rm -rf "$tmp_dir" 2>/dev/null || true
       ;;
   esac
 
